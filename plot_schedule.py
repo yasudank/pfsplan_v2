@@ -3,10 +3,12 @@ import csv
 import numpy as np
 from astropy.time import Time
 import datetime
+import re
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.patches import Circle
 from matplotlib.animation import FuncAnimation
+from matplotlib.colors import LinearSegmentedColormap
 import warnings
 
 from obs_utils import setup_observer, read_targets, read_obsdates, read_priorities
@@ -39,7 +41,44 @@ def read_schedule(filename):
         return None
     return schedule
 
-def plot_altitude_time(schedule, nights):
+def get_target_colors(all_targets):
+    """
+    Create a dictionary mapping target ID to color based on ppc_code group.
+    """
+    # Filter IDs
+    co_ids_raw = list(set(t['id'] for t in all_targets if t['id'].startswith('SSP_CO')))
+    ga_ids = sorted(list(set(t['id'] for t in all_targets if t['id'].startswith('SSP_GA'))))
+    ge_ids = sorted(list(set(t['id'] for t in all_targets if t['id'].startswith('SSP_GE'))))
+
+    # Custom sort for SSP_CO based on the number before 'h'
+    def co_sort_key(tid):
+        match = re.search(r'_(\d+)h_', tid)
+        if match:
+            return int(match.group(1))
+        return 999999999 # Fallback for IDs not matching the pattern
+
+    co_ids = sorted(co_ids_raw, key=co_sort_key)
+    
+    # Create colormaps
+    cm_co = LinearSegmentedColormap.from_list("co", ["blue", "violet"])
+    cm_ga = LinearSegmentedColormap.from_list("ga", ["yellow", "green"])
+    cm_ge = LinearSegmentedColormap.from_list("ge", ["red", "orange"])
+    
+    target_colors = {}
+    
+    def assign_colors(ids, cmap):
+        n = len(ids)
+        for i, tid in enumerate(ids):
+            norm = i / (n - 1) if n > 1 else 0.5
+            target_colors[tid] = cmap(norm)
+            
+    assign_colors(co_ids, cm_co)
+    assign_colors(ga_ids, cm_ga)
+    assign_colors(ge_ids, cm_ge)
+    
+    return target_colors
+
+def plot_altitude_time(schedule, nights, target_colors=None):
     """
     Plot Altitude vs Time for the schedule.
     One panel per night.
@@ -77,21 +116,15 @@ def plot_altitude_time(schedule, nights):
         night_obs = [s for s in schedule if s['night'] == night_idx]
         
         if night_obs:
-            # Separate Manual and Auto
-            manual_obs = [s for s in night_obs if s.get('note') == 'Manual']
-            auto_obs = [s for s in night_obs if s.get('note') != 'Manual']
-
-            # Plot Auto
-            if auto_obs:
-                times_auto = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in auto_obs]
-                alts_auto = [s['altitude'] for s in auto_obs]
-                ax.scatter(times_auto, alts_auto, label=f"Auto", color=colors[i], s=20, marker='o')
-
-            # Plot Manual
-            if manual_obs:
-                times_man = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in manual_obs]
-                alts_man = [s['altitude'] for s in manual_obs]
-                ax.scatter(times_man, alts_man, label=f"Manual", color='red', s=60, marker='*', edgecolors='black')
+            # Plot All Observations with target colors
+            times = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in night_obs]
+            alts = [s['altitude'] for s in night_obs]
+            
+            if target_colors:
+                c = [target_colors.get(s['target'], 'grey') for s in night_obs]
+                ax.scatter(times, alts, label="Observations", c=c, s=20, marker='o')
+            else:
+                ax.scatter(times, alts, label="Observations", color=colors[i], s=20, marker='o')
         
         ax.set_ylabel("Altitude (deg)")
         ax.set_title(f"Night {night_idx} (HST)")
@@ -122,7 +155,7 @@ def plot_altitude_time(schedule, nights):
     plt.close(fig)
     print("Saved altitude_vs_time.png")
 
-def plot_rotator_angle_time(schedule, nights):
+def plot_rotator_angle_time(schedule, nights, target_colors=None):
     """
     Plot Rotator Angle vs Time for the schedule.
     """
@@ -156,21 +189,15 @@ def plot_rotator_angle_time(schedule, nights):
         night_obs = [s for s in schedule if s['night'] == night_idx]
         
         if night_obs:
-            # Separate Manual and Auto
-            manual_obs = [s for s in night_obs if s.get('note') == 'Manual']
-            auto_obs = [s for s in night_obs if s.get('note') != 'Manual']
-
-            # Plot Auto
-            if auto_obs:
-                times_auto = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in auto_obs]
-                rots_auto = [s.get('rotator_angle', 0) for s in auto_obs]
-                ax.scatter(times_auto, rots_auto, label=f"Auto", color=colors[i], s=20, marker='o')
-
-            # Plot Manual
-            if manual_obs:
-                times_man = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in manual_obs]
-                rots_man = [s.get('rotator_angle', 0) for s in manual_obs]
-                ax.scatter(times_man, rots_man, label=f"Manual", color='red', s=60, marker='*', edgecolors='black')
+            # Plot All Observations with target colors
+            times = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in night_obs]
+            rots = [s.get('rotator_angle', 0) for s in night_obs]
+            
+            if target_colors:
+                c = [target_colors.get(s['target'], 'grey') for s in night_obs]
+                ax.scatter(times, rots, label="Observations", c=c, s=20, marker='o')
+            else:
+                ax.scatter(times, rots, label="Observations", color=colors[i], s=20, marker='o')
         
         ax.set_ylabel("Rotator Angle (deg)")
         ax.set_title(f"Night {night_idx} (HST)")
@@ -197,7 +224,7 @@ def plot_rotator_angle_time(schedule, nights):
     plt.close(fig)
     print("Saved rotator_angle_vs_time.png")
 
-def plot_sky_coverage(schedule, all_targets):
+def plot_sky_coverage(schedule, all_targets, target_colors=None):
     """
     Plot Sky Coverage.
     Two panels:
@@ -208,16 +235,16 @@ def plot_sky_coverage(schedule, all_targets):
     - Scheduled targets: Filled circles with specific color
     - Unobserved targets: Unfilled circles with specific color
     
-    Colors:
-    - SSP_CO: blueviolet
-    - SSP_GA: yellowgreen
-    - SSP_GE: orangered
+    Colors based on target_colors map.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
     from matplotlib.lines import Line2D
     
     print("Generating Sky Coverage plot...")
+    
+    if target_colors is None:
+        target_colors = get_target_colors(all_targets)
     
     try:
         scheduled_ids = set(s['target'] for s in schedule)
@@ -226,13 +253,7 @@ def plot_sky_coverage(schedule, all_targets):
         
         # Helper for color
         def get_color(tid):
-            if tid.startswith('SSP_CO'):
-                return 'blueviolet'
-            elif tid.startswith('SSP_GA'):
-                return 'yellowgreen'
-            elif tid.startswith('SSP_GE'):
-                return 'orangered'
-            return 'grey'
+            return target_colors.get(tid, 'grey')
 
         for t in all_targets:
             tid = t['id']
@@ -309,19 +330,19 @@ def plot_sky_coverage(schedule, all_targets):
         if 'fig' in locals():
             plt.close(fig)
 
-def plot_sky_coverage_mollweide(schedule, all_targets):
+def plot_sky_coverage_mollweide(schedule, all_targets, target_colors=None):
     """
     Plot Sky Coverage for the entire sky using Mollweide projection.
-    Colors:
-    - SSP_CO: blueviolet
-    - SSP_GA: yellowgreen
-    - SSP_GE: orangered
+    Colors based on target_colors map.
     """
     import matplotlib.pyplot as plt
     import numpy as np
     from matplotlib.lines import Line2D
     
     print("Generating Sky Coverage (Mollweide) plot...")
+    
+    if target_colors is None:
+        target_colors = get_target_colors(all_targets)
     
     try:
         if schedule:
@@ -332,19 +353,13 @@ def plot_sky_coverage_mollweide(schedule, all_targets):
         fig = plt.figure(figsize=(12, 8))
         ax = fig.add_subplot(111, projection='mollweide')
         
-        # Helper for color
         def get_category(tid):
-            if tid.startswith('SSP_CO'):
-                return 'SSP_CO', 'blueviolet'
-            elif tid.startswith('SSP_GA'):
-                return 'SSP_GA', 'yellowgreen'
-            elif tid.startswith('SSP_GE'):
-                return 'SSP_GE', 'orangered'
-            return 'Other', 'grey'
+            if tid.startswith('SSP_CO'): return 'SSP_CO'
+            if tid.startswith('SSP_GA'): return 'SSP_GA'
+            if tid.startswith('SSP_GE'): return 'SSP_GE'
+            return 'Other'
 
         # Data structure to hold coordinates for each category and status
-        # keys: (category, is_scheduled)
-        # values: {'ra': [], 'dec': [], 'color': str}
         data = {}
 
         for t in all_targets:
@@ -360,26 +375,28 @@ def plot_sky_coverage_mollweide(schedule, all_targets):
             dec_plot = np.radians(dec_deg)
             
             is_scheduled = tid in scheduled_ids
-            cat, color = get_category(tid)
+            cat = get_category(tid)
+            color = target_colors.get(tid, 'grey')
             
             key = (cat, is_scheduled)
             if key not in data:
-                data[key] = {'ra': [], 'dec': [], 'color': color}
+                data[key] = {'ra': [], 'dec': [], 'colors': []}
             
             data[key]['ra'].append(ra_plot)
             data[key]['dec'].append(dec_plot)
+            data[key]['colors'].append(color)
             
         # Plotting
         for (cat, is_scheduled), val in data.items():
             if not val['ra']:
                 continue
                 
-            color = val['color']
+            c_array = val['colors']
             if is_scheduled:
-                ax.scatter(val['ra'], val['dec'], c=color, edgecolors=color, alpha=0.7, s=20, label=f"{cat} (Sched)")
+                ax.scatter(val['ra'], val['dec'], c=c_array, edgecolors=c_array, alpha=0.7, s=20, label=f"{cat} (Sched)")
             else:
                 # Unobserved: open circles
-                ax.scatter(val['ra'], val['dec'], facecolors='none', edgecolors=color, alpha=0.4, s=15, label=f"{cat} (Unobs)")
+                ax.scatter(val['ra'], val['dec'], facecolors='none', edgecolors=c_array, alpha=0.4, s=15, label=f"{cat} (Unobs)")
 
         ax.grid(True)
         ax.set_title("Sky Coverage (Mollweide, RA 0 at Center)")
@@ -399,9 +416,9 @@ def plot_sky_coverage_mollweide(schedule, all_targets):
         
         # Custom Legend
         legend_elements = [
-            Line2D([0], [0], marker='o', color='w', label='SSP_CO', markerfacecolor='blueviolet', markersize=10),
-            Line2D([0], [0], marker='o', color='w', label='SSP_GA', markerfacecolor='yellowgreen', markersize=10),
-            Line2D([0], [0], marker='o', color='w', label='SSP_GE', markerfacecolor='orangered', markersize=10),
+            Line2D([0], [0], marker='o', color='w', label='SSP_CO', markerfacecolor='blue', markersize=10),
+            Line2D([0], [0], marker='o', color='w', label='SSP_GA', markerfacecolor='green', markersize=10),
+            Line2D([0], [0], marker='o', color='w', label='SSP_GE', markerfacecolor='red', markersize=10),
             Line2D([0], [0], marker='o', color='w', label='Scheduled (Filled)', markerfacecolor='grey', markersize=10),
             Line2D([0], [0], marker='o', color='w', label='Unobserved (Open)', markerfacecolor='none', markeredgecolor='grey', markersize=10),
         ]
@@ -418,15 +435,8 @@ def plot_sky_coverage_mollweide(schedule, all_targets):
         traceback.print_exc()
         if 'fig' in locals():
             plt.close(fig)
-        
-    except Exception as e:
-        print(f"Error generating sky coverage mollweide plot: {e}")
-        import traceback
-        traceback.print_exc()
-        if 'fig' in locals():
-            plt.close(fig)
 
-def animate_sky_coverage_progress(schedule, all_targets):
+def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
     """
     Animate Sky Coverage progress (cumulative) over the nights.
     Saves as 'sky_coverage_progress.gif'.
@@ -437,6 +447,9 @@ def animate_sky_coverage_progress(schedule, all_targets):
     from matplotlib.animation import FuncAnimation
     
     print("Generating Sky Coverage Progress animation...")
+
+    if target_colors is None:
+        target_colors = get_target_colors(all_targets)
     
     if not schedule:
         print("No schedule to animate.")
@@ -459,13 +472,7 @@ def animate_sky_coverage_progress(schedule, all_targets):
     
     # Helper for color
     def get_color(tid):
-        if tid.startswith('SSP_CO'):
-            return 'blueviolet'
-        elif tid.startswith('SSP_GA'):
-            return 'yellowgreen'
-        elif tid.startswith('SSP_GE'):
-            return 'orangered'
-        return 'grey'
+        return target_colors.get(tid, 'grey')
         
     patches_map = {}
     
@@ -585,8 +592,9 @@ def main():
     
     if not schedule:
         print("Schedule is empty. Generating empty sky coverage plot.")
-        plot_sky_coverage(schedule, all_targets)
-        plot_sky_coverage_mollweide(schedule, all_targets)
+        target_colors = get_target_colors(all_targets)
+        plot_sky_coverage(schedule, all_targets, target_colors)
+        plot_sky_coverage_mollweide(schedule, all_targets, target_colors)
         print("Altitude vs time plot not generated as there are no observations.")
         return
 
@@ -602,12 +610,13 @@ def main():
         print("Cannot generate altitude vs time plot.")
         nights = []
 
+    target_colors = get_target_colors(all_targets)
     if nights:
-        plot_altitude_time(schedule, nights)
-        plot_rotator_angle_time(schedule, nights)
-    plot_sky_coverage(schedule, all_targets)
-    plot_sky_coverage_mollweide(schedule, all_targets)
-    animate_sky_coverage_progress(schedule, all_targets)
+        plot_altitude_time(schedule, nights, target_colors)
+        plot_rotator_angle_time(schedule, nights, target_colors)
+    plot_sky_coverage(schedule, all_targets, target_colors)
+    plot_sky_coverage_mollweide(schedule, all_targets, target_colors)
+    animate_sky_coverage_progress(schedule, all_targets, target_colors)
 
 if __name__ == '__main__':
     main()

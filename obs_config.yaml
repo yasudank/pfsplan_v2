@@ -1,0 +1,21 @@
+# Observation Configuration Parameters
+
+slew:
+  speed_az: 0.5      # deg/sec
+  speed_el: 0.5      # deg/sec
+  speed_rot: 1.5     # deg/sec
+
+constraints:
+  max_airmass: 1.6
+  min_altitude: 0.0   # degrees
+  min_teff: 0.6
+  rotator_min: -174.0 # degrees
+  rotator_max: 174.0  # degrees
+
+scheduling:
+  min_overhead_min: 5        # minutes
+  manual_readout_min: 15     # minutes
+  overlap_separation_deg: 1.4 # degrees
+  adjacency_bonus_window_sec: 5.0
+  adjacency_bonus_score: 1000.0
+  slew_penalty_weight: 0.5

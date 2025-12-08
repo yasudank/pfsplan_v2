@@ -11,6 +11,9 @@ constraints:
   min_teff: 0.6
   rotator_min: -174.0 # degrees
   rotator_max: 174.0  # degrees
+  min_moon_sep: 60.0  # degrees
+  max_moon_ill: 0.30
+  max_moon_alt: 30
 
 scheduling:
   min_overhead_min: 5        # minutes

@@ -1,7 +1,7 @@
-# plot_schedule.py
 import csv
 import numpy as np
 from astropy.time import Time
+from astropy.coordinates import get_body
 import datetime
 import re
 import matplotlib.pyplot as plt
@@ -78,7 +78,7 @@ def get_target_colors(all_targets):
     
     return target_colors
 
-def plot_altitude_time(schedule, nights, target_colors=None):
+def plot_altitude_time(schedule, nights, observer, target_colors=None):
     """
     Plot Altitude vs Time for the schedule.
     One panel per night.
@@ -94,7 +94,7 @@ def plot_altitude_time(schedule, nights, target_colors=None):
     
     n_nights = len(nights)
     
-    fig, axes = plt.subplots(n_nights, 1, figsize=(12, 4 * n_nights), sharex=False)
+    fig, axes = plt.subplots(n_nights, 1, figsize=(10, 7), sharex=False, sharey=True)
     if n_nights == 1:
         axes = [axes]
     
@@ -107,10 +107,69 @@ def plot_altitude_time(schedule, nights, target_colors=None):
         # Twilight times in HST
         start_hst = start_utc.datetime - datetime.timedelta(hours=10)
         end_hst = end_utc.datetime - datetime.timedelta(hours=10)
+
+        # Set title with date
+        date_str = start_hst.strftime('%Y-%m-%d')
+        ax.set_title(f"{date_str} (HST)", loc='left', fontsize=10)
         
-        # Plot twilight lines
-        ax.axvline(start_hst, color='red', linestyle='--', alpha=0.7, label='Twilight')
-        ax.axvline(end_hst, color='red', linestyle='--', alpha=0.7)
+        # Set common x-axis limits: 17:00 previous day to 07:00 current day
+        # Anchor to the twilight start date
+        # If start_hst is early morning (e.g. < 15:00), it belongs to the previous date's night
+        anchor_date = start_hst.date()
+        if start_hst.hour < 15:
+            anchor_date -= datetime.timedelta(days=1)
+            
+        xlim_start = datetime.datetime.combine(anchor_date, datetime.time(18, 0))
+        xlim_end = xlim_start + datetime.timedelta(hours=12) # 06:00 next day
+        
+        # --- Draw Twilight Shade ---
+        # Create a time grid for calculation (200 points)
+        total_minutes = (xlim_end - xlim_start).total_seconds() / 60
+        minutes_grid = np.linspace(0, total_minutes, 200)
+        times_dt_naive_hst = [xlim_start + datetime.timedelta(minutes=m) for m in minutes_grid]
+        times_dt_naive_utc = [t + datetime.timedelta(hours=10) for t in times_dt_naive_hst]
+        times_astropy = Time(times_dt_naive_utc)
+        
+        # Calculate Sun Altitude
+        sun_coo = get_body("sun", times_astropy, location=observer.location)
+        sun_alt = observer.altaz(times_astropy, sun_coo).alt.deg
+
+        # Calculate Moon Altitude
+        moon_coo = get_body("moon", times_astropy, location=observer.location)
+        moon_alt = observer.altaz(times_astropy, moon_coo).alt.deg
+        
+        # Create gradient image data (1 row, N cols, RGBA)
+        img_data = np.zeros((1, len(minutes_grid), 4))
+        # Orange-ish color for twilight (R=1.0, G=0.7, B=0.2)
+        img_data[:, :, 0] = 1.0
+        img_data[:, :, 1] = 0.7
+        img_data[:, :, 2] = 0.2
+        
+        # Calculate Alpha based on altitude
+        # Alt >= 0: Max Alpha
+        # -18 < Alt < 0: Linear fade
+        # Alt <= -18: 0
+        max_alpha = 0.5
+        alphas = np.zeros_like(sun_alt)
+        
+        mask_day = sun_alt >= 0
+        mask_twilight = (sun_alt < 0) & (sun_alt > -18)
+        
+        alphas[mask_day] = max_alpha
+        alphas[mask_twilight] = max_alpha * (sun_alt[mask_twilight] + 18) / 18.0
+        
+        img_data[:, :, 3] = alphas
+        
+        # Draw gradient using imshow
+        ax.imshow(img_data, extent=[mdates.date2num(xlim_start), mdates.date2num(xlim_end), 0, 90], 
+                  aspect='auto', origin='lower', zorder=0)
+        
+        # Plot Moon Altitude
+        ax.plot(times_dt_naive_hst, moon_alt, color='black', linestyle='--', alpha=0.6, label='Moon', zorder=5)
+
+        # Plot twilight lines (reference)
+        ax.axvline(start_hst, color='red', linestyle='--', alpha=0.5, label='Twilight')
+        ax.axvline(end_hst, color='red', linestyle='--', alpha=0.5)
         
         # Filter observations for this night
         night_obs = [s for s in schedule if s['night'] == night_idx]
@@ -122,32 +181,29 @@ def plot_altitude_time(schedule, nights, target_colors=None):
             
             if target_colors:
                 c = [target_colors.get(s['target'], 'grey') for s in night_obs]
-                ax.scatter(times, alts, label="Observations", c=c, s=20, marker='o')
+                ax.scatter(times, alts, label="Observations", c=c, s=30, marker='o', zorder=10)
             else:
-                ax.scatter(times, alts, label="Observations", color=colors[i], s=20, marker='o')
+                ax.scatter(times, alts, label="Observations", color=colors[i], s=30, marker='o', zorder=10)
         
-        ax.set_ylabel("Altitude (deg)")
-        ax.set_title(f"Night {night_idx} (HST)")
         ax.grid(True, alpha=0.3)
         
-        # Set common x-axis limits: 17:00 previous day to 07:00 current day
-        # Anchor to the twilight start date
-        # If start_hst is early morning (e.g. < 15:00), it belongs to the previous date's night
-        anchor_date = start_hst.date()
-        if start_hst.hour < 15:
-            anchor_date -= datetime.timedelta(days=1)
-            
-        xlim_start = datetime.datetime.combine(anchor_date, datetime.time(17, 0))
-        xlim_end = xlim_start + datetime.timedelta(hours=14) # 07:00 next day
-        
         ax.set_xlim(xlim_start, xlim_end)
+
+        ax.set_yticks(range(0, 91, 30))
+        ax.set_ylim(0, 90)
+
+        # Warning zone for low altitude
+        ax.fill_between([xlim_start, xlim_end], 0, 30, color='red', alpha=0.15, zorder=0)
         
         # Format x-axis
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         
-        # Add legend
-        ax.legend(loc='upper right')
-        
+        # Hide x-axis labels for all but the bottom panel
+        if i < n_nights - 1:
+            ax.tick_params(labelbottom=False)
+
+    fig.supylabel('Altitude (deg)', fontsize=14)
+
     axes[-1].set_xlabel("Time (HST)")
     plt.tight_layout()
     
@@ -565,6 +621,101 @@ def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
 
     plt.close(fig)
 
+def plot_observation_counts(schedule, all_targets, target_colors=None):
+    """
+    Plot histogram of observation counts per target.
+    Inset: Observation counts per working group (CO, GA, GE).
+    """
+    print("Generating Observation Counts plot...")
+    import matplotlib.pyplot as plt
+    from collections import Counter
+    
+    if target_colors is None:
+        target_colors = get_target_colors(all_targets)
+
+    # Count observations per target
+    counts = Counter(s['target'] for s in schedule)
+    if not counts:
+        print("No observations to plot.")
+        return
+
+    # Sort targets for plotting order: Group (CO, GA, GE) then ID
+    def sort_key(tid):
+        # Category score
+        if tid.startswith('SSP_CO'): cat = 1
+        elif tid.startswith('SSP_GA'): cat = 2
+        elif tid.startswith('SSP_GE'): cat = 3
+        else: cat = 4
+        
+        # Sub-sort using logic similar to get_target_colors
+        match = re.search(r'_(\d+)h_', tid)
+        num = int(match.group(1)) if match else 999999
+        
+        return (cat, num, tid)
+
+    # Only plot targets that were observed
+    observed_tids = sorted(counts.keys(), key=sort_key)
+    
+    # Prepare data for main plot
+    x_labels = observed_tids
+    y_values = [counts[tid] for tid in observed_tids]
+    bar_colors = [target_colors.get(tid, 'grey') for tid in observed_tids]
+    
+    # Prepare data for inset (Group counts)
+    group_counts = {'CO': 0, 'GA': 0, 'GE': 0}
+    for tid, count in counts.items():
+        if tid.startswith('SSP_CO'): group_counts['CO'] += count
+        elif tid.startswith('SSP_GA'): group_counts['GA'] += count
+        elif tid.startswith('SSP_GE'): group_counts['GE'] += count
+    
+    # Plotting
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Main Bar Chart
+    bars = ax.bar(x_labels, y_values, color=bar_colors)
+    
+    ax.set_ylabel("Observation Count")
+    ax.set_title("Observation Counts per Target")
+    
+    # Handle x-axis labels
+    if len(x_labels) > 50:
+        ax.set_xlabel("Targets (Sorted by Group: CO -> GA -> GE)")
+        ax.tick_params(labelbottom=False) # Hide labels if too crowded
+    else:
+        ax.set_xlabel("Target ID")
+        plt.xticks(rotation=90, ha='right', fontsize=8)
+
+    # Inset: Group Counts
+    # Position: Top right [left, bottom, width, height]
+    ax_ins = fig.add_axes([0.75, 0.65, 0.15, 0.2]) 
+    
+    groups = ['CO', 'GA', 'GE']
+    g_vals = [group_counts[g] for g in groups]
+    # Colors representative of the groups (Blue-ish, Green-ish, Red-ish)
+    g_colors = ['blueviolet', 'yellowgreen', 'orangered']
+    
+    ax_ins.bar(groups, g_vals, color=g_colors)
+    ax_ins.set_title("Counts by Group", fontsize=9)
+    ax_ins.tick_params(axis='both', which='major', labelsize=8)
+    
+    # Adjust ylim to fit labels
+    if g_vals:
+        ax_ins.set_ylim(0, max(g_vals) * 1.3)
+    
+    # Annotate inset bars with count and percentage
+    total_obs = sum(g_vals)
+    for i, v in enumerate(g_vals):
+        pct = (v / total_obs * 100) if total_obs > 0 else 0
+        ax_ins.text(i, v, f"{v}\n({pct:.1f}%)", ha='center', va='bottom', fontsize=7)
+    
+    # Add grid for y-axis on main plot
+    ax.grid(axis='y', linestyle='--', alpha=0.5)
+
+    plt.tight_layout() # Note: tight_layout might warn with add_axes, but usually works ok-ish or ignored
+    plt.savefig("observation_counts.png")
+    plt.close(fig)
+    print("Saved observation_counts.png")
+
 def main():
     observer = setup_observer()
     
@@ -612,11 +763,12 @@ def main():
 
     target_colors = get_target_colors(all_targets)
     if nights:
-        plot_altitude_time(schedule, nights, target_colors)
+        plot_altitude_time(schedule, nights, observer, target_colors)
         plot_rotator_angle_time(schedule, nights, target_colors)
     plot_sky_coverage(schedule, all_targets, target_colors)
     plot_sky_coverage_mollweide(schedule, all_targets, target_colors)
     animate_sky_coverage_progress(schedule, all_targets, target_colors)
+    plot_observation_counts(schedule, all_targets, target_colors)
 
 if __name__ == '__main__':
     main()

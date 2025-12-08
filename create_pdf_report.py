@@ -1,7 +1,7 @@
 import pandas as pd
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
@@ -11,6 +11,7 @@ import astropy.units as u
 from obs_utils import setup_observer
 import warnings
 import yaml
+import os
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
@@ -89,10 +90,43 @@ def create_pdf_report(csv_file, output_pdf):
         alignment=TA_CENTER
     )
 
-    # --- Page 1: Cover / Placeholder ---
+    # --- Page 1: Cover / Visuals ---
     elements.append(Paragraph("Observation Plan Report", title_style))
-    elements.append(Spacer(1, 5*cm))
-    elements.append(Paragraph("Summary Page (Placeholder for Page 1)", styles['Normal']))
+    elements.append(Spacer(1, 0.5*cm))
+    
+    try:
+        images_row = []
+        if os.path.exists('altitude_vs_time.png'):
+            # images_row.append([Paragraph("Altitude vs Time", styles['Heading3']), Image('altitude_vs_time.png', width=13.5*cm, height=10*cm, kind='proportional')])
+            # Easier to just put the image in the cell
+            img1 = Image('altitude_vs_time.png', width=13.5*cm, height=10*cm, kind='proportional')
+            images_row.append(img1)
+        else:
+            images_row.append(Paragraph("Altitude Plot Missing", styles['Normal']))
+
+        if os.path.exists('observation_counts.png'):
+            img2 = Image('observation_counts.png', width=13.5*cm, height=10*cm, kind='proportional')
+            images_row.append(img2)
+        else:
+            images_row.append(Paragraph("Counts Plot Missing", styles['Normal']))
+            
+        if images_row:
+            # Create a table for side-by-side layout
+            # Page width A4 landscape ~29.7cm. Margins 1+1=2cm. Usable ~27.7cm.
+            # Two images of 13.5cm fits.
+            t_images = Table([images_row], colWidths=[13.8*cm, 13.8*cm])
+            t_images.setStyle(TableStyle([
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('LEFTPADDING', (0,0), (-1,-1), 0),
+                ('RIGHTPADDING', (0,0), (-1,-1), 0),
+            ]))
+            elements.append(t_images)
+            
+    except Exception as e:
+        print(f"Warning: Could not add images to report: {e}")
+        elements.append(Paragraph(f"Error loading images: {e}", styles['Normal']))
+
     elements.append(PageBreak())
     
     # --- Page 2: Statistics / Placeholder ---

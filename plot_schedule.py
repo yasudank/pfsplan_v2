@@ -34,6 +34,10 @@ def read_schedule(filename):
                 row['dec'] = float(row['dec'])
                 if 'rotator_angle' in row:
                     row['rotator_angle'] = float(row['rotator_angle'])
+                if 'rot_start' in row:
+                    row['rot_start'] = float(row['rot_start'])
+                if 'rot_end' in row:
+                    row['rot_end'] = float(row['rot_end'])
                 # note column is string, so no conversion needed
                 schedule.append(row)
     except FileNotFoundError:
@@ -211,7 +215,7 @@ def plot_altitude_time(schedule, nights, observer, target_colors=None):
     plt.close(fig)
     print("Saved altitude_vs_time.png")
 
-def plot_rotator_angle_time(schedule, nights, target_colors=None):
+def plot_rotator_angle_time(schedule, nights, observer, target_colors=None):
     """
     Plot Rotator Angle vs Time for the schedule.
     """
@@ -223,7 +227,7 @@ def plot_rotator_angle_time(schedule, nights, target_colors=None):
     
     n_nights = len(nights)
     
-    fig, axes = plt.subplots(n_nights, 1, figsize=(12, 4 * n_nights), sharex=False)
+    fig, axes = plt.subplots(n_nights, 1, figsize=(10, 7), sharex=False, sharey=True)
     if n_nights == 1:
         axes = [axes]
     
@@ -236,10 +240,57 @@ def plot_rotator_angle_time(schedule, nights, target_colors=None):
         # Twilight times in HST
         start_hst = start_utc.datetime - datetime.timedelta(hours=10)
         end_hst = end_utc.datetime - datetime.timedelta(hours=10)
+
+        # Set title with date
+        date_str = start_hst.strftime('%Y-%m-%d')
+        ax.set_title(f"{date_str} (HST)", loc='left', fontsize=10)
         
+        # Set common x-axis limits
+        anchor_date = start_hst.date()
+        if start_hst.hour < 15:
+            anchor_date -= datetime.timedelta(days=1)
+            
+        xlim_start = datetime.datetime.combine(anchor_date, datetime.time(18, 0))
+        xlim_end = xlim_start + datetime.timedelta(hours=12) 
+        
+        # --- Draw Twilight Shade ---
+        # Create a time grid for calculation (200 points)
+        total_minutes = (xlim_end - xlim_start).total_seconds() / 60
+        minutes_grid = np.linspace(0, total_minutes, 200)
+        times_dt_naive_hst = [xlim_start + datetime.timedelta(minutes=m) for m in minutes_grid]
+        times_dt_naive_utc = [t + datetime.timedelta(hours=10) for t in times_dt_naive_hst]
+        times_astropy = Time(times_dt_naive_utc)
+        
+        # Calculate Sun Altitude
+        sun_coo = get_body("sun", times_astropy, location=observer.location)
+        sun_alt = observer.altaz(times_astropy, sun_coo).alt.deg
+        
+        # Create gradient image data (1 row, N cols, RGBA)
+        img_data = np.zeros((1, len(minutes_grid), 4))
+        # Orange-ish color for twilight (R=1.0, G=0.7, B=0.2)
+        img_data[:, :, 0] = 1.0
+        img_data[:, :, 1] = 0.7
+        img_data[:, :, 2] = 0.2
+        
+        # Calculate Alpha based on altitude
+        max_alpha = 0.5
+        alphas = np.zeros_like(sun_alt)
+        
+        mask_day = sun_alt >= 0
+        mask_twilight = (sun_alt < 0) & (sun_alt > -18)
+        
+        alphas[mask_day] = max_alpha
+        alphas[mask_twilight] = max_alpha * (sun_alt[mask_twilight] + 18) / 18.0
+        
+        img_data[:, :, 3] = alphas
+        
+        # Draw gradient using imshow
+        ax.imshow(img_data, extent=[mdates.date2num(xlim_start), mdates.date2num(xlim_end), -180, 180], 
+                  aspect='auto', origin='lower', zorder=0)
+
         # Plot twilight lines
-        ax.axvline(start_hst, color='red', linestyle='--', alpha=0.7, label='Twilight')
-        ax.axvline(end_hst, color='red', linestyle='--', alpha=0.7)
+        ax.axvline(start_hst, color='red', linestyle='--', alpha=0.5, label='Twilight')
+        ax.axvline(end_hst, color='red', linestyle='--', alpha=0.5)
         
         # Filter observations for this night
         night_obs = [s for s in schedule if s['night'] == night_idx]
@@ -247,32 +298,32 @@ def plot_rotator_angle_time(schedule, nights, target_colors=None):
         if night_obs:
             # Plot All Observations with target colors
             times = [Time(s['start_time']).datetime - datetime.timedelta(hours=10) for s in night_obs]
-            rots = [s.get('rotator_angle', 0) for s in night_obs]
+            # Use rot_start if available, else fallback to rotator_angle
+            rots = [s.get('rot_start', s.get('rotator_angle', 0)) for s in night_obs]
             
             if target_colors:
                 c = [target_colors.get(s['target'], 'grey') for s in night_obs]
-                ax.scatter(times, rots, label="Observations", c=c, s=20, marker='o')
+                ax.scatter(times, rots, label="Observations", c=c, s=20, marker='o', zorder=10)
             else:
-                ax.scatter(times, rots, label="Observations", color=colors[i], s=20, marker='o')
+                ax.scatter(times, rots, label="Observations", color=colors[i], s=20, marker='o', zorder=10)
         
-        ax.set_ylabel("Rotator Angle (deg)")
-        ax.set_title(f"Night {night_idx} (HST)")
         ax.grid(True, alpha=0.3)
         ax.set_ylim(-180, 180)
-        
-        # Set common x-axis limits
-        anchor_date = start_hst.date()
-        if start_hst.hour < 15:
-            anchor_date -= datetime.timedelta(days=1)
-            
-        xlim_start = datetime.datetime.combine(anchor_date, datetime.time(17, 0))
-        xlim_end = xlim_start + datetime.timedelta(hours=14) 
+        ax.set_yticks(range(-180, 181, 60)) # -180, -120, -60, 0, 60, 120, 180
         
         ax.set_xlim(xlim_start, xlim_end)
+        
+        # Warning zone for rotator limits (-174, 174)
+        ax.fill_between([xlim_start, xlim_end], -180, -174, color='red', alpha=0.15, zorder=0)
+        ax.fill_between([xlim_start, xlim_end], 174, 180, color='red', alpha=0.15, zorder=0)
+
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
         
-        ax.legend(loc='upper right')
+        # Hide x-axis labels for all but the bottom panel
+        if i < n_nights - 1:
+            ax.tick_params(labelbottom=False)
         
+    fig.supylabel('Rotator Angle (deg)', fontsize=14)
     axes[-1].set_xlabel("Time (HST)")
     plt.tight_layout()
     
@@ -764,7 +815,7 @@ def main():
     target_colors = get_target_colors(all_targets)
     if nights:
         plot_altitude_time(schedule, nights, observer, target_colors)
-        plot_rotator_angle_time(schedule, nights, target_colors)
+        plot_rotator_angle_time(schedule, nights, observer, target_colors)
     plot_sky_coverage(schedule, all_targets, target_colors)
     plot_sky_coverage_mollweide(schedule, all_targets, target_colors)
     animate_sky_coverage_progress(schedule, all_targets, target_colors)

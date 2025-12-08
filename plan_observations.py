@@ -452,21 +452,47 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     mid_time = f_start + manual_block_len/2
                     altaz = observer.altaz(mid_time, r_target['target'])
                     
-                    # Calculate rotator angle
-                    pa = observer.parallactic_angle(mid_time, r_target['target']).to(u.deg).value
-                    rot = Angle((pa + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                    # Calculate Rotator Angle (Start/End)
+                    pa_start = observer.parallactic_angle(f_start, r_target['target']).to(u.deg).value
+                    rot_start = Angle((pa_start + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
                     
+                    pa_end = observer.parallactic_angle(f_end, r_target['target']).to(u.deg).value
+                    rot_end = Angle((pa_end + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+
+                    # Calculate LST
+                    lst = observer.local_sidereal_time(f_start).to_string(sep=':', precision=0)
+                    
+                    # Moon Stats
+                    moon_coord = get_body('moon', f_start, location=observer.location)
+                    #moon_sep = r_target['target'].coord.separation(moon_coord).deg
+                    moon_sep = moon_coord.separation(r_target['target'].coord).deg
+
+                    moon_altaz_obj = observer.altaz(f_start, moon_coord)
+                    moon_alt = moon_altaz_obj.alt.deg
+                    moon_illum = observer.moon_illumination(f_start)
+                    
+                    # Teff
+                    sun = get_body('sun', f_start, location=observer.location)
+                    moon_phase = moon_coord.separation(sun, origin_mismatch="ignore")
+                    teff = calculate_teff(observer, r_target['target'].coord, altaz.alt.deg, altaz.secz, moon_coord, moon_altaz_obj, moon_phase, mbm)
+
                     schedule.append({
                         'night': night_idx + 1,
                         'target': r_target['id'],
                         'start_time': f_start.iso,
                         'end_time': f_end.iso,
+                        'lst': lst,
+                        'moon_sep': moon_sep,
+                        'moon_illum': moon_illum,
+                        'moon_alt': moon_alt,
+                        'teff': teff,
+                        'rot_start': rot_start,
+                        'rot_end': rot_end,
                         'altitude': altaz.alt.deg,
                         'airmass': altaz.secz,
                         'exptime': 900, # 15 min assumption
                         'ra': r_target['target'].coord.ra.deg,
                         'dec': r_target['target'].coord.dec.deg,
-                        'rotator_angle': rot,
                         'note': 'Manual'
                     })
                     if r_target['target'].coord not in observed_history:
@@ -475,7 +501,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                 current_time = r_end # Advance current_time to the end of the manual block
                 current_pointing = r_target['target'].coord
                 # Update rotator angle (rot was calculated for the last frame mid-time, roughly correct for end state)
-                current_rotator_angle = rot
+                current_rotator_angle = rot_end
             
             # Case 2: Gap is too short for any observation, advance current_time past the gap
             elif (next_reservation_start - current_time) < (min_overhead + manual_readout_exptime):
@@ -611,17 +637,43 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     obs_start_time = current_time + final_overhead
                     obs_end_time = obs_start_time + exptime
                     
+                    # Calculate Rotator Angle (Start/End)
+                    pa_start = observer.parallactic_angle(obs_start_time, best_target['target']).to(u.deg).value
+                    rot_start = Angle((pa_start + best_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                    
+                    pa_end = observer.parallactic_angle(obs_end_time, best_target['target']).to(u.deg).value
+                    rot_end = Angle((pa_end + best_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+
+                    # Calculate LST
+                    lst = observer.local_sidereal_time(obs_start_time).to_string(sep=':', precision=0)
+                    
+                    # Moon Stats
+                    moon_coord = get_body('moon', obs_start_time, location=observer.location)
+                    #moon_sep = best_target['target'].coord.separation(moon_coord).deg
+                    moon_sep = moon_coord.separation(best_target['target'].coord).deg
+                    moon_altaz_obj = observer.altaz(obs_start_time, moon_coord)
+                    moon_alt = moon_altaz_obj.alt.deg
+                    moon_illum = observer.moon_illumination(obs_start_time)
+                    
+                    # Teff (Already calculated as best_candidate_for_timeslot['teff'])
+
                     schedule.append({
                         'night': night_idx + 1,
                         'target': best_target['id'],
                         'start_time': obs_start_time.iso, # Actual observation start time
                         'end_time': obs_end_time.iso,
+                        'lst': lst,
+                        'moon_sep': moon_sep,
+                        'moon_illum': moon_illum,
+                        'moon_alt': moon_alt,
+                        'teff': best_candidate_for_timeslot['teff'],
+                        'rot_start': rot_start,
+                        'rot_end': rot_end,
                         'altitude': best_alt,
                         'airmass': best_airmass,
                         'exptime': best_target['exptime'],
                         'ra': best_target['target'].coord.ra.deg,
                         'dec': best_target['target'].coord.dec.deg,
-                        'rotator_angle': best_candidate_for_timeslot['rotator_angle'],
                         'slew_time': final_overhead.to(u.s).value, # Log slew time as seconds
                         'note': 'Auto'
                     })

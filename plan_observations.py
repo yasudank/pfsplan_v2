@@ -399,11 +399,71 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                 # Current busy slots from reservations
                 busy = [(r[0], r[1]) for r in reservations]
                 
-                # Align search grid to observation block length (20 min) to prevent fragmentation
-                start_slot = find_optimal_slot(observer, target_info, total_duration, start_time, end_time, busy, manual_block_len, target_info['ppc_pa'], config)
+                # Align search grid to 1 min to allow fine-tuning, but ensure block length consistency
+                # Note: find_optimal_slot candidates will be spaced by time_step
+                start_slot = find_optimal_slot(observer, target_info, total_duration, start_time, end_time, busy, 1*u.min, target_info['ppc_pa'], config)
                 
                 if start_slot:
+                    # --- Gap Check Logic ---
+                    # Define minimum gap for Auto observations (4 frames)
+                    min_auto_gap = 4 * (min_overhead + 15 * u.min) # ~80 min
+                    
+                    # Estimate effective Auto block length (including avg slew)
+                    # Overhead (5m) + Exp (15m) + Slew (~1m) = 21m
+                    est_auto_len = min_overhead + 15 * u.min + 1 * u.min
+                    
+                    # Calculate potential end slot
                     end_slot = start_slot + total_duration
+                    
+                    # Find the nearest busy block before and after
+                    nearest_end_before = start_time
+                    nearest_start_after = end_time
+                    
+                    for b_start, b_end in busy:
+                        # Add tolerance for float comparison
+                        if b_end <= start_slot + 1*u.s and b_end > nearest_end_before:
+                            nearest_end_before = b_end
+                        if b_start >= end_slot - 1*u.s and b_start < nearest_start_after:
+                            nearest_start_after = b_start
+                            
+                    gap_before = start_slot - nearest_end_before
+                    gap_after = nearest_start_after - end_slot
+                    
+                    shifted = False
+                    
+                    # 1. Close small gaps (< 80 min) completely
+                    if 0 < gap_before.to(u.min).value < min_auto_gap.to(u.min).value:
+                        print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
+                        start_slot = nearest_end_before
+                        end_slot = start_slot + total_duration
+                        shifted = True
+                    
+                    # 2. Optimize large gaps (> 80 min) to avoid wasted tail
+                    elif gap_before.to(u.min).value >= min_auto_gap.to(u.min).value:
+                        remainder = (gap_before.to(u.min).value) % est_auto_len.to(u.min).value
+                        # If remainder is significant but useless (e.g., < 20 min), shift earlier to consume it
+                        # A valid Auto block needs ~20 min. If we have 15 min left, it's waste.
+                        # We shift Manual block earlier by 'remainder' so the gap becomes a multiple of est_auto_len.
+                        if 0 < remainder < (min_overhead + 15*u.min).to(u.min).value:
+                             shift_amount = remainder * u.min
+                             print(f"    - [Adjust] Optimizing large gap before {ppc_code}. Remainder {remainder:.1f}m. Shifting earlier by {shift_amount:.1f}")
+                             start_slot = start_slot - shift_amount
+                             end_slot = start_slot + total_duration
+                             shifted = True
+
+                    # Then check 'after' gap (using new end_slot)
+                    if not shifted:
+                        gap_after = nearest_start_after - end_slot
+                        if 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
+                             # Check if shifting later fits
+                             potential_start = nearest_start_after - total_duration
+                             if potential_start >= nearest_end_before:
+                                 print(f"    - [Adjust] Closing small gap after {ppc_code} ({gap_after.to(u.min):.1f}). Shifting to {potential_start.iso}")
+                                 start_slot = potential_start
+                                 end_slot = nearest_start_after
+                                 shifted = True
+                        # Optimize large gap after? (Maybe less critical as it pushes into end of night/next block)
+                    
                     reservations.append((start_slot, end_slot, target_info, nframes))
                     mid_alt = observer.altaz(start_slot + total_duration/2, target_info['target']).alt.deg
                     print(f"    - Scheduled {ppc_code} ({nframes} frames) at {start_slot.iso} (Avg Alt: {mid_alt:.1f})")
@@ -414,6 +474,54 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
         # Sort reservations by start time
         reservations.sort(key=lambda x: x[0])
         
+        # --- 1b. Compact Manual Schedule (Post-processing) ---
+        # Close gaps < min_auto_gap between manual blocks to prevent single Auto frames
+        # min_auto_gap is ~80 min
+        min_auto_gap = 4 * (min_overhead + 15 * u.min)
+        
+        # 1. Check Gap from Night Start to First Block
+        if reservations:
+            r_start, r_end, r_target, r_nframes = reservations[0]
+            gap = r_start - start_time
+            if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
+                # Try to shift earlier to start_time
+                new_start = start_time
+                new_end = new_start + (r_end - r_start)
+                
+                # Verify Rotator Constraint
+                # Check mid-point
+                t_mid = new_start + (new_end - new_start)/2
+                pa = observer.parallactic_angle(t_mid, r_target['target']).to(u.deg).value
+                rot = Angle((pa + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                
+                if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
+                    print(f"    - [Compact] Closing start gap ({gap.to(u.min):.1f}). Shifting {r_target['id']} to {new_start.iso}")
+                    reservations[0] = (new_start, new_end, r_target, r_nframes)
+
+        # 2. Check Gaps between Blocks
+        for i in range(len(reservations) - 1):
+            curr_start, curr_end, curr_target, curr_nframes = reservations[i]
+            next_start, next_end, next_target, next_nframes = reservations[i+1]
+            
+            gap = next_start - curr_end
+            
+            if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
+                # Try to shift 'next' earlier to 'curr_end'
+                duration = next_end - next_start
+                new_start = curr_end
+                new_end = new_start + duration
+                
+                # Verify Rotator Constraint
+                t_mid = new_start + duration/2
+                pa = observer.parallactic_angle(t_mid, next_target['target']).to(u.deg).value
+                rot = Angle((pa + next_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                
+                if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
+                    print(f"    - [Compact] Closing inter-block gap ({gap.to(u.min):.1f}). Shifting {next_target['id']} to {new_start.iso}")
+                    reservations[i+1] = (new_start, new_end, next_target, next_nframes)
+                    # Update local variable for next iteration? No, next iteration uses i+1 as curr.
+                    # But we updated reservations list, so next iter will see new values. Correct.
+
         # Mark reserved manual targets as observed
         for r_start, r_end, r_target, r_nframes in reservations:
             r_target['observed'] = True # Mark as observed for greedy algorithm

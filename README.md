@@ -69,10 +69,39 @@ This will generate several image files in the current directory, including:
 *   `sky_coverage.png`
 *   `sky_coverage_progress.gif`
 
+### 3. Generate PDF Report
+
+After generating the schedule and plots, you can create a comprehensive PDF report:
+
+```bash
+python create_pdf_report.py
+```
+
+This will generate `schedule_report.pdf`, which includes all generated plots and a detailed tabular schedule for each night, highlighting any observations that violate configured constraints.
+
+## Scheduling Algorithm
+
+The `plan_observations.py` script employs a hybrid scheduling approach, ensuring high-priority manual targets are fixed while efficiently filling gaps with a greedy optimization strategy.
+
+### 1. Manual Allocation Phase
+First, the scheduler processes targets defined in `manual_allocation.csv`:
+*   **Prioritization**: Enforces project-specific ordering (e.g., GE targets before GA).
+*   **Smart Grouping**: Spatially adjacent targets (separation < 5°) are grouped into contiguous blocks.
+*   **Slot Optimization**: Finds optimal time slots based on altitude and rotator constraints. It includes logic to "compact" the schedule, shifting blocks to close unusable gaps (< 80 mins) or align with the night's start/end.
+
+### 2. Auto-Scheduling Phase (Greedy Gap Filling)
+Remaining time slots are filled dynamically:
+*   **Constraint Checking**: Calculates visibility for all candidates using parallel processing, checking airmass, rotator limits, and moon constraints (brightness/distance).
+*   **Scoring & Selection**:
+    1.  **Overlap**: Prioritizes targets overlapping with recent observations to maximize survey continuity.
+    2.  **Efficiency Score**: For non-overlapping targets, selects based on `Altitude - (Slew Penalty * Distance)`, balancing airmass against slew time.
+
 ## File Structure
 
 *   `plan_observations.py`: Main scheduling logic.
 *   `plot_schedule.py`: Visualization tools.
+*   `create_pdf_report.py`: Generates a comprehensive PDF report of the schedule and plots.
+*   `schedule_report.pdf`: The output PDF report.
 *   `obs_utils.py`: Utility functions for observer setup and file I/O.
 *   `Moon.py`: Moon brightness model.
 *   `slew.py`: Slew time calculations.

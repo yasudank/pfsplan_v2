@@ -487,7 +487,28 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                 print(f"  [Manual] Scheduling fixed targets for {hst_date_str}...")
                 manual_requests = manual_schedule[hst_date_str]
                 
-                for req in sorted(manual_requests, key=lambda x: x['ppc_code']): # Sort for consistent results
+                # Check for GE and GA presence to enforce ordering
+                has_ge = any('SSP_GE' in r['ppc_code'] for r in manual_requests)
+                has_ga = any('SSP_GA' in r['ppc_code'] for r in manual_requests)
+                enforce_ge_before_ga = has_ge and has_ga
+
+                # Sort requests
+                # If enforcing order: GE (0) -> Others (1) -> GA (2)
+                # Then by ppc_code
+                def manual_sort_key(req):
+                    code = req['ppc_code']
+                    priority_group = 1 # Default
+                    if enforce_ge_before_ga:
+                        if 'SSP_GE' in code: priority_group = 0
+                        elif 'SSP_GA' in code: priority_group = 2
+                    return (priority_group, code)
+
+                # manual_requests is a list of dicts, so we can sort in place or create new list
+                sorted_requests = sorted(manual_requests, key=manual_sort_key)
+                
+                max_ge_end_time = start_time # Track end of GE observations
+                
+                for req in sorted_requests:
                     ppc_code = req['ppc_code']
                     nframes = req['nframes']
                     
@@ -501,9 +522,14 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     # Current busy slots from reservations
                     busy = [(r[0], r[1]) for r in reservations]
                     
+                    # Determine search start time
+                    search_start = start_time
+                    if enforce_ge_before_ga and 'SSP_GA' in ppc_code:
+                        search_start = max(start_time, max_ge_end_time)
+                    
                     # Align search grid to 1 min to allow fine-tuning, but ensure block length consistency
                     # Note: find_optimal_slot candidates will be spaced by time_step
-                    start_slot = find_optimal_slot(observer, target_info, total_duration, start_time, end_time, busy, 1*u.min, target_info['ppc_pa'], config)
+                    start_slot = find_optimal_slot(observer, target_info, total_duration, search_start, end_time, busy, 1*u.min, target_info['ppc_pa'], config)
                     
                     if start_slot:
                         # --- Gap Check Logic ---
@@ -535,10 +561,14 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         
                         # 1. Close small gaps (< 80 min) completely
                         if 0 < gap_before.to(u.min).value < min_auto_gap.to(u.min).value:
-                            print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
-                            start_slot = nearest_end_before
-                            end_slot = start_slot + total_duration
-                            shifted = True
+                            # Ensure we don't shift before max_ge_end_time if it's a GA target
+                            if enforce_ge_before_ga and 'SSP_GA' in ppc_code and nearest_end_before < max_ge_end_time:
+                                pass # Cannot shift into forbidden zone (though nearest_end_before should be >= max_ge_end_time usually)
+                            else:
+                                print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
+                                start_slot = nearest_end_before
+                                end_slot = start_slot + total_duration
+                                shifted = True
                         
                         # 2. Optimize large gaps (> 80 min) to avoid wasted tail
                         elif gap_before.to(u.min).value >= min_auto_gap.to(u.min).value:
@@ -548,10 +578,19 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                             # We shift Manual block earlier by 'remainder' so the gap becomes a multiple of est_auto_len.
                             if 0 < remainder < (min_overhead + 15*u.min).to(u.min).value:
                                  shift_amount = remainder * u.min
-                                 print(f"    - [Adjust] Optimizing large gap before {ppc_code}. Remainder {remainder:.1f}m. Shifting earlier by {shift_amount:.1f}")
-                                 start_slot = start_slot - shift_amount
-                                 end_slot = start_slot + total_duration
-                                 shifted = True
+                                 new_start = start_slot - shift_amount
+                                 
+                                 # Constraint check
+                                 valid_shift = True
+                                 if enforce_ge_before_ga and 'SSP_GA' in ppc_code:
+                                     if new_start < max_ge_end_time:
+                                         valid_shift = False
+                                         
+                                 if valid_shift:
+                                     print(f"    - [Adjust] Optimizing large gap before {ppc_code}. Remainder {remainder:.1f}m. Shifting earlier by {shift_amount:.1f}")
+                                     start_slot = new_start
+                                     end_slot = start_slot + total_duration
+                                     shifted = True
 
                         # Then check 'after' gap (using new end_slot)
                         if not shifted:
@@ -559,7 +598,8 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                             if 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
                                  # Check if shifting later fits
                                  potential_start = nearest_start_after - total_duration
-                                 if potential_start >= nearest_end_before:
+                                 if potential_start >= nearest_end_before: # And check overlap/bounds
+                                     # Note: Shifting later doesn't violate "GA after GE" if it was already valid
                                      print(f"    - [Adjust] Closing small gap after {ppc_code} ({gap_after.to(u.min):.1f}). Shifting to {potential_start.iso}")
                                      start_slot = potential_start
                                      end_slot = nearest_start_after
@@ -570,6 +610,12 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         mid_alt = observer.altaz(start_slot + total_duration/2, target_info['target']).alt.deg
                         print(f"    - Scheduled {ppc_code} ({nframes} frames) at {start_slot.iso} (Avg Alt: {mid_alt:.1f})")
                         target_info['observed'] = True # Mark as observed
+                        
+                        # Update max_ge_end_time
+                        if enforce_ge_before_ga and 'SSP_GE' in ppc_code:
+                            if end_slot > max_ge_end_time:
+                                max_ge_end_time = end_slot
+                                
                     else:
                         print(f"    - [Warning] Could not find slot for {ppc_code}!")
 

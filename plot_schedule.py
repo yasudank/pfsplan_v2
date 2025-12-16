@@ -11,7 +11,7 @@ from matplotlib.animation import FuncAnimation
 from matplotlib.colors import LinearSegmentedColormap
 import warnings
 
-from obs_utils import setup_observer, read_targets, read_obsdates, read_priorities
+from obs_utils import setup_observer, read_targets, read_obsdates, read_priorities, read_targets_from_ppcList
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -776,11 +776,12 @@ def main():
         print("Warning: Could not read priorities. Proceeding with default priority for all targets.")
     
     all_targets = []
-    target_files = ['CO_summary_reconfigure.csv', 'GA_summary_reconfigure.csv', 'GE_summary_reconfigure.csv']
+    target_files = ['targets/CO/ppcList.ecsv', 'targets/GA/ppcList.ecsv', 'targets/GE/ppcList.ecsv']
+    #target_files = ['CO_summary_reconfigure.csv', 'GA_summary_reconfigure.csv', 'GE_summary_reconfigure.csv']
     
     for fname in target_files:
         try:
-            targets = read_targets(fname, priorities)
+            targets = read_targets_from_ppcList(fname, priorities)
             all_targets.extend(targets)
             print(f"Loaded {len(targets)} targets from {fname}.")
         except FileNotFoundError:
@@ -805,7 +806,7 @@ def main():
     num_nights = max(s['night'] for s in schedule)
         
     try:
-        nights = read_obsdates('obsdates_2025Nov.txt', observer, skip_days=8)
+        nights = read_obsdates('obsdates_2026Jan.txt', observer)
         print(f"Loaded {len(nights)} observation windows.")
     except FileNotFoundError:
         print("Error: Observation dates file 'obsdates_2025Nov.txt' not found.")

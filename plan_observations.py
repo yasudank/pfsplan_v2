@@ -4,11 +4,13 @@ import pandas as pd
 import astropy.units as u
 from astropy.coordinates import AltAz, get_body, SkyCoord, Angle
 from astropy.time import Time
+from astropy.table import Table
 from astroplan import FixedTarget
 import warnings
 from obs_utils import setup_observer, read_obsdates, read_priorities
 import datetime
 import yaml
+import concurrent.futures
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -196,6 +198,71 @@ def calculate_teff(observer, target_coord, target_alt, target_airmass, moon_coor
     
     return teff_abs / teff0
 
+def check_visibility_worker(args):
+    """
+    Worker function to check visibility for a single target.
+    Arguments are packed in a tuple to be compatible with map/executor.
+    """
+    (t, current_time, current_pointing, cur_altaz, current_rotator_angle, 
+     next_reservation_start, observer, slew_params, min_overhead, 
+     max_airmass, rot_min, rot_max, min_teff, 
+     moon_coord, moon_altaz, moon_phase, mbm, verbose) = args
+
+    try:
+        # Calculate potential overhead including slew
+        tgt_altaz_for_slew = observer.altaz(current_time, t['target']) 
+        
+        # Calculate parallactic angle for current time
+        pa_angle = observer.parallactic_angle(current_time, t['target']).to(u.deg).value
+        raw_rotator_angle = pa_angle + t['ppc_pa']
+        rotator_angle = Angle(raw_rotator_angle * u.deg).wrap_at(180 * u.deg).value
+        
+        if current_pointing is not None:
+            slew_time_val = calculate_slew_time(cur_altaz, current_rotator_angle, tgt_altaz_for_slew, rotator_angle, slew_params, verbose=verbose)
+            overhead = min_overhead + slew_time_val
+        else:
+            overhead = min_overhead
+        
+        # Check if fits in gap
+        req_duration = t['exptime']*u.s + overhead
+        if current_time + req_duration > next_reservation_start:
+            return None
+        
+        # Calculate alt/airmass and rotator angle for the actual mid-point of exposure
+        obs_start_time_for_eval = current_time + overhead
+        obs_mid_time_for_eval = obs_start_time_for_eval + t['exptime']*u.s / 2
+        
+        altaz_obs_mid = observer.altaz(obs_mid_time_for_eval, t['target'])
+        alt = altaz_obs_mid.alt.deg
+        airmass = altaz_obs_mid.secz
+        
+        pa_angle_obs_mid = observer.parallactic_angle(obs_mid_time_for_eval, t['target']).to(u.deg).value
+        rotator_angle_obs_mid = Angle((pa_angle_obs_mid + t['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+
+        if airmass <= max_airmass and alt > 0:
+            # Check instrument rotator angle constraint at observation mid-point
+            if rotator_angle_obs_mid < rot_min or rotator_angle_obs_mid > rot_max:
+                return None
+                
+            teff = calculate_teff(observer, t['target'].coord, alt, airmass, moon_coord, moon_altaz, moon_phase, mbm)
+            if teff > min_teff:
+                return {
+                    'info': t,
+                    'alt': alt,
+                    'airmass': airmass,
+                    'coord': t['target'].coord,
+                    'teff': teff,
+                    'rotator_angle': rotator_angle_obs_mid,
+                    'overhead': overhead
+                }
+    except Exception as e:
+        # In case of calculation error, just skip
+        if verbose:
+            print(f"Error checking target {t['id']}: {e}")
+        return None
+        
+    return None
+
 def load_all_targets(priorities):
     """
     Load targets from CO, GA, and GE summary files.
@@ -207,6 +274,39 @@ def load_all_targets(priorities):
     for filename in files:
         try:
             df = pd.read_csv(filename)
+            for _, row in df.iterrows():
+                ppc_code = row['ppc_code']
+                # Only CO targets usually have priorities. Others default to 99.
+                priority = priorities.get(ppc_code, 99)
+                
+                coord = SkyCoord(ra=row['ppc_ra']*u.deg, dec=row['ppc_dec']*u.deg)
+                target = FixedTarget(coord=coord, name=ppc_code)
+                
+                all_targets[ppc_code] = {
+                    'id': ppc_code,
+                    'target': target,
+                    'exptime': float(row['ppc_exptime']),
+                    'observed': False,
+                    'priority': priority,
+                    'nframes': int(row['ppc_nframes']) if 'ppc_nframes' in row else 1,
+                    'ppc_pa': float(row['ppc_pa'])
+                }
+        except FileNotFoundError:
+            print(f"Warning: {filename} not found.")
+            
+    return all_targets
+
+def load_all_targets_from_ppcList(priorities):
+    """
+    Load targets from CO, GA, and GE ppcList files.
+    Returns a dictionary of target info keyed by ppc_code.
+    """
+    all_targets = {}
+    files = ['targets/CO/ppcList.ecsv', 'targets/GA/ppcList.ecsv', 'targets/GE/ppcList.ecsv']
+    
+    for filename in files:
+        try:
+            df = Table.read(filename, format='ascii.ecsv').to_pandas()
             for _, row in df.iterrows():
                 ppc_code = row['ppc_code']
                 # Only CO targets usually have priorities. Others default to 99.
@@ -369,431 +469,401 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
     # Get unique priorities for auto-scheduling (exclude default 99)
     greedy_priorities = sorted(list(set(t['priority'] for t in all_targets.values() if t['priority'] < 99)))
     
-    for night_idx, (start_time, end_time) in enumerate(nights):
-        current_time = start_time
-        current_pointing = None
-        current_rotator_angle = 0.0 # Initialize rotator angle
-        
-        print(f"\n=== Night {night_idx+1}: {start_time.iso} to {end_time.iso} ===")
-        
-        # --- 1. Reserve Manual Targets ---
-        # Get HST date string for manual schedule lookup
-        hst_date_str = (start_time - 10*u.hour).to_datetime().date().isoformat()
-        reservations = [] # List of (start, end, target_info, nframes)
-        
-        if hst_date_str in manual_schedule:
-            print(f"  [Manual] Scheduling fixed targets for {hst_date_str}...")
-            manual_requests = manual_schedule[hst_date_str]
+    executor = concurrent.futures.ProcessPoolExecutor()
+    try:
+        for night_idx, (start_time, end_time) in enumerate(nights):
+            current_time = start_time
+            current_pointing = None
+            current_rotator_angle = 0.0 # Initialize rotator angle
             
-            for req in sorted(manual_requests, key=lambda x: x['ppc_code']): # Sort for consistent results
-                ppc_code = req['ppc_code']
-                nframes = req['nframes']
+            print(f"\n=== Night {night_idx+1}: {start_time.iso} to {end_time.iso} ===")
+            
+            # --- 1. Reserve Manual Targets ---
+            # Get HST date string for manual schedule lookup
+            hst_date_str = (start_time - 10*u.hour).to_datetime().date().isoformat()
+            reservations = [] # List of (start, end, target_info, nframes)
+            
+            if hst_date_str in manual_schedule:
+                print(f"  [Manual] Scheduling fixed targets for {hst_date_str}...")
+                manual_requests = manual_schedule[hst_date_str]
                 
-                if ppc_code not in all_targets:
-                    print(f"  [Error] Manual target {ppc_code} not found in database.")
-                    continue
-                
-                target_info = all_targets[ppc_code]
-                total_duration = nframes * manual_block_len
-                
-                # Current busy slots from reservations
-                busy = [(r[0], r[1]) for r in reservations]
-                
-                # Align search grid to 1 min to allow fine-tuning, but ensure block length consistency
-                # Note: find_optimal_slot candidates will be spaced by time_step
-                start_slot = find_optimal_slot(observer, target_info, total_duration, start_time, end_time, busy, 1*u.min, target_info['ppc_pa'], config)
-                
-                if start_slot:
-                    # --- Gap Check Logic ---
-                    # Define minimum gap for Auto observations (4 frames)
-                    min_auto_gap = 4 * (min_overhead + 15 * u.min) # ~80 min
+                for req in sorted(manual_requests, key=lambda x: x['ppc_code']): # Sort for consistent results
+                    ppc_code = req['ppc_code']
+                    nframes = req['nframes']
                     
-                    # Estimate effective Auto block length (including avg slew)
-                    # Overhead (5m) + Exp (15m) + Slew (~1m) = 21m
-                    est_auto_len = min_overhead + 15 * u.min + 1 * u.min
+                    if ppc_code not in all_targets:
+                        print(f"  [Error] Manual target {ppc_code} not found in database.")
+                        continue
                     
-                    # Calculate potential end slot
-                    end_slot = start_slot + total_duration
+                    target_info = all_targets[ppc_code]
+                    total_duration = nframes * manual_block_len
                     
-                    # Find the nearest busy block before and after
-                    nearest_end_before = start_time
-                    nearest_start_after = end_time
+                    # Current busy slots from reservations
+                    busy = [(r[0], r[1]) for r in reservations]
                     
-                    for b_start, b_end in busy:
-                        # Add tolerance for float comparison
-                        if b_end <= start_slot + 1*u.s and b_end > nearest_end_before:
-                            nearest_end_before = b_end
-                        if b_start >= end_slot - 1*u.s and b_start < nearest_start_after:
-                            nearest_start_after = b_start
-                            
-                    gap_before = start_slot - nearest_end_before
-                    gap_after = nearest_start_after - end_slot
+                    # Align search grid to 1 min to allow fine-tuning, but ensure block length consistency
+                    # Note: find_optimal_slot candidates will be spaced by time_step
+                    start_slot = find_optimal_slot(observer, target_info, total_duration, start_time, end_time, busy, 1*u.min, target_info['ppc_pa'], config)
                     
-                    shifted = False
-                    
-                    # 1. Close small gaps (< 80 min) completely
-                    if 0 < gap_before.to(u.min).value < min_auto_gap.to(u.min).value:
-                        print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
-                        start_slot = nearest_end_before
+                    if start_slot:
+                        # --- Gap Check Logic ---
+                        # Define minimum gap for Auto observations (4 frames)
+                        min_auto_gap = 4 * (min_overhead + 15 * u.min) # ~80 min
+                        
+                        # Estimate effective Auto block length (including avg slew)
+                        # Overhead (5m) + Exp (15m) + Slew (~1m) = 21m
+                        est_auto_len = min_overhead + 15 * u.min + 1 * u.min
+                        
+                        # Calculate potential end slot
                         end_slot = start_slot + total_duration
-                        shifted = True
-                    
-                    # 2. Optimize large gaps (> 80 min) to avoid wasted tail
-                    elif gap_before.to(u.min).value >= min_auto_gap.to(u.min).value:
-                        remainder = (gap_before.to(u.min).value) % est_auto_len.to(u.min).value
-                        # If remainder is significant but useless (e.g., < 20 min), shift earlier to consume it
-                        # A valid Auto block needs ~20 min. If we have 15 min left, it's waste.
-                        # We shift Manual block earlier by 'remainder' so the gap becomes a multiple of est_auto_len.
-                        if 0 < remainder < (min_overhead + 15*u.min).to(u.min).value:
-                             shift_amount = remainder * u.min
-                             print(f"    - [Adjust] Optimizing large gap before {ppc_code}. Remainder {remainder:.1f}m. Shifting earlier by {shift_amount:.1f}")
-                             start_slot = start_slot - shift_amount
-                             end_slot = start_slot + total_duration
-                             shifted = True
-
-                    # Then check 'after' gap (using new end_slot)
-                    if not shifted:
-                        gap_after = nearest_start_after - end_slot
-                        if 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
-                             # Check if shifting later fits
-                             potential_start = nearest_start_after - total_duration
-                             if potential_start >= nearest_end_before:
-                                 print(f"    - [Adjust] Closing small gap after {ppc_code} ({gap_after.to(u.min):.1f}). Shifting to {potential_start.iso}")
-                                 start_slot = potential_start
-                                 end_slot = nearest_start_after
-                                 shifted = True
-                        # Optimize large gap after? (Maybe less critical as it pushes into end of night/next block)
-                    
-                    reservations.append((start_slot, end_slot, target_info, nframes))
-                    mid_alt = observer.altaz(start_slot + total_duration/2, target_info['target']).alt.deg
-                    print(f"    - Scheduled {ppc_code} ({nframes} frames) at {start_slot.iso} (Avg Alt: {mid_alt:.1f})")
-                    target_info['observed'] = True # Mark as observed
-                else:
-                    print(f"    - [Warning] Could not find slot for {ppc_code}!")
-
-        # Sort reservations by start time
-        reservations.sort(key=lambda x: x[0])
-        
-        # --- 1b. Compact Manual Schedule (Post-processing) ---
-        # Close gaps < min_auto_gap between manual blocks to prevent single Auto frames
-        # min_auto_gap is ~80 min
-        min_auto_gap = 4 * (min_overhead + 15 * u.min)
-        
-        # 1. Check Gap from Night Start to First Block
-        if reservations:
-            r_start, r_end, r_target, r_nframes = reservations[0]
-            gap = r_start - start_time
-            if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
-                # Try to shift earlier to start_time
-                new_start = start_time
-                new_end = new_start + (r_end - r_start)
-                
-                # Verify Rotator Constraint
-                # Check mid-point
-                t_mid = new_start + (new_end - new_start)/2
-                pa = observer.parallactic_angle(t_mid, r_target['target']).to(u.deg).value
-                rot = Angle((pa + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-                
-                if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
-                    print(f"    - [Compact] Closing start gap ({gap.to(u.min):.1f}). Shifting {r_target['id']} to {new_start.iso}")
-                    reservations[0] = (new_start, new_end, r_target, r_nframes)
-
-        # 2. Check Gaps between Blocks
-        for i in range(len(reservations) - 1):
-            curr_start, curr_end, curr_target, curr_nframes = reservations[i]
-            next_start, next_end, next_target, next_nframes = reservations[i+1]
-            
-            gap = next_start - curr_end
-            
-            if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
-                # Try to shift 'next' earlier to 'curr_end'
-                duration = next_end - next_start
-                new_start = curr_end
-                new_end = new_start + duration
-                
-                # Verify Rotator Constraint
-                t_mid = new_start + duration/2
-                pa = observer.parallactic_angle(t_mid, next_target['target']).to(u.deg).value
-                rot = Angle((pa + next_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-                
-                if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
-                    print(f"    - [Compact] Closing inter-block gap ({gap.to(u.min):.1f}). Shifting {next_target['id']} to {new_start.iso}")
-                    reservations[i+1] = (new_start, new_end, next_target, next_nframes)
-                    # Update local variable for next iteration? No, next iteration uses i+1 as curr.
-                    # But we updated reservations list, so next iter will see new values. Correct.
-
-        # Mark reserved manual targets as observed
-        for r_start, r_end, r_target, r_nframes in reservations:
-            r_target['observed'] = True # Mark as observed for greedy algorithm
-
-        # --- 2. Fill Gaps with Greedy Algorithm ---
-        while current_time < end_time:
-            
-            # Check for upcoming reservation
-            active_reservation = None
-            next_reservation_start = end_time
-            
-            for r_start, r_end, r_target, r_nframes in reservations:
-                if r_start <= current_time < r_end:
-                    active_reservation = (r_start, r_end, r_target, r_nframes)
-                    break
-                if r_start > current_time:
-                    next_reservation_start = r_start
-                    break
-            
-            # Case 1: Current time is within an active manual reservation
-            if active_reservation:
-                r_start, r_end, r_target, r_nframes = active_reservation
-                
-                # Align current_time if we drifted slightly or skipped
-                # We log individual frames
-                base_time = max(current_time, r_start)
-                
-                for i in range(r_nframes):
-                    f_start = r_start + i * manual_block_len
-                    f_end = f_start + manual_block_len
-                    
-                    # Don't log if it's already past (shouldn't happen with proper logic)
-                    if f_end <= current_time: 
-                        continue
-
-                    mid_time = f_start + manual_block_len/2
-                    altaz = observer.altaz(mid_time, r_target['target'])
-                    
-                    # Calculate Rotator Angle (Start/End)
-                    pa_start = observer.parallactic_angle(f_start, r_target['target']).to(u.deg).value
-                    rot_start = Angle((pa_start + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-                    
-                    pa_end = observer.parallactic_angle(f_end, r_target['target']).to(u.deg).value
-                    rot_end = Angle((pa_end + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-
-                    # Calculate LST
-                    lst = observer.local_sidereal_time(f_start).to_string(sep=':', precision=0)
-                    
-                    # Moon Stats
-                    moon_coord = get_body('moon', f_start, location=observer.location)
-                    #moon_sep = r_target['target'].coord.separation(moon_coord).deg
-                    moon_sep = moon_coord.separation(r_target['target'].coord).deg
-
-                    moon_altaz_obj = observer.altaz(f_start, moon_coord)
-                    moon_alt = moon_altaz_obj.alt.deg
-                    moon_illum = observer.moon_illumination(f_start)
-                    
-                    # Teff
-                    sun = get_body('sun', f_start, location=observer.location)
-                    moon_phase = moon_coord.separation(sun, origin_mismatch="ignore")
-                    teff = calculate_teff(observer, r_target['target'].coord, altaz.alt.deg, altaz.secz, moon_coord, moon_altaz_obj, moon_phase, mbm)
-
-                    schedule.append({
-                        'night': night_idx + 1,
-                        'target': r_target['id'],
-                        'start_time': f_start.iso,
-                        'end_time': f_end.iso,
-                        'lst': lst,
-                        'moon_sep': moon_sep,
-                        'moon_illum': moon_illum,
-                        'moon_alt': moon_alt,
-                        'teff': teff,
-                        'rot_start': rot_start,
-                        'rot_end': rot_end,
-                        'altitude': altaz.alt.deg,
-                        'airmass': altaz.secz,
-                        'exptime': 900, # 15 min assumption
-                        'ra': r_target['target'].coord.ra.deg,
-                        'dec': r_target['target'].coord.dec.deg,
-                        'note': 'Manual'
-                    })
-                    if r_target['target'].coord not in observed_history:
-                        observed_history.append(r_target['target'].coord)
-                
-                current_time = r_end # Advance current_time to the end of the manual block
-                current_pointing = r_target['target'].coord
-                # Update rotator angle (rot was calculated for the last frame mid-time, roughly correct for end state)
-                current_rotator_angle = rot_end
-            
-            # Case 2: Gap is too short for any observation, advance current_time past the gap
-            elif (next_reservation_start - current_time) < (min_overhead + manual_readout_exptime):
-                current_time = next_reservation_start
-            
-            # Case 3: There is a valid gap to fill with greedy targets
-            else:
-                best_candidate_for_timeslot = None
-                
-                moon_coord = get_body('moon', current_time, location=observer.location)
-                moon_altaz = observer.altaz(current_time, moon_coord)
-                sun = get_body('sun', current_time, location=observer.location)
-                moon_phase = moon_coord.separation(sun, origin_mismatch="ignore")
-
-                # Current telescope state for slew calc
-                if current_pointing is not None:
-                    cur_altaz_coord = SkyCoord(current_pointing)
-                    cur_altaz = observer.altaz(current_time, cur_altaz_coord)
-                else:
-                    cur_altaz = None
-
-                # Iterate priorities
-                for priority in greedy_priorities:
-                    if verbose:
-                        print(f"[Verbose] Checking Priority {priority}")
-
-                    visible_candidates = []
-                    # all_targets is a dict, iterate values
-                    for t in all_targets.values():
-                        if t['observed'] or t['priority'] != priority:
-                            continue
                         
-                        # Calculate potential overhead including slew
-                        # Need target AltAz and Rotator at start time to estimate slew
-                        tgt_altaz_for_slew = observer.altaz(current_time, t['target']) 
+                        # Find the nearest busy block before and after
+                        nearest_end_before = start_time
+                        nearest_start_after = end_time
                         
-                        # Calculate parallactic angle for current time
-                        pa_angle = observer.parallactic_angle(current_time, t['target']).to(u.deg).value
-                        raw_rotator_angle = pa_angle + t['ppc_pa']
-                        rotator_angle = Angle(raw_rotator_angle * u.deg).wrap_at(180 * u.deg).value
-                        
-                        if current_pointing is not None:
-                            slew_time_val = calculate_slew_time(cur_altaz, current_rotator_angle, tgt_altaz_for_slew, rotator_angle, slew_params, verbose=verbose)
-                            overhead = min_overhead + slew_time_val
-                        else:
-                            overhead = min_overhead
-                        
-                        if verbose:
-                            print(f"[Verbose-Overhead] Target {t['id']}: Calculated overhead = {overhead.to(u.s).value:.2f} s")
-                            
-                        # Check if fits in gap
-                        req_duration = t['exptime']*u.s + overhead
-                        if current_time + req_duration > next_reservation_start:
-                            continue
-                        
-                        # Calculate alt/airmass and rotator angle for the actual mid-point of exposure
-                        obs_start_time_for_eval = current_time + overhead
-                        obs_mid_time_for_eval = obs_start_time_for_eval + t['exptime']*u.s / 2
-                        
-                        altaz_obs_mid = observer.altaz(obs_mid_time_for_eval, t['target'])
-                        alt = altaz_obs_mid.alt.deg
-                        airmass = altaz_obs_mid.secz
-                        
-                        pa_angle_obs_mid = observer.parallactic_angle(obs_mid_time_for_eval, t['target']).to(u.deg).value
-                        rotator_angle_obs_mid = Angle((pa_angle_obs_mid + t['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-
-                        if airmass <= max_airmass and alt > 0:
-                            # Check instrument rotator angle constraint at observation mid-point
-                            if rotator_angle_obs_mid < rot_min or rotator_angle_obs_mid > rot_max:
-                                if verbose:
-                                    print(f"[Verbose]   - {t['id']}: Rejected (rotator angle {rotator_angle_obs_mid:.1f} out of bounds) at {current_time.iso}")
-                                continue
+                        for b_start, b_end in busy:
+                            # Add tolerance for float comparison
+                            if b_end <= start_slot + 1*u.s and b_end > nearest_end_before:
+                                nearest_end_before = b_end
+                            if b_start >= end_slot - 1*u.s and b_start < nearest_start_after:
+                                nearest_start_after = b_start
                                 
-                            teff = calculate_teff(observer, t['target'].coord, alt, airmass, moon_coord, moon_altaz, moon_phase, mbm)
-                            if teff > min_teff:
-                                visible_candidates.append({
-                                    'info': t,
-                                    'alt': alt,
-                                    'airmass': airmass,
-                                    'coord': t['target'].coord,
-                                    'teff': teff,
-                                    'rotator_angle': rotator_angle_obs_mid, # Use recalculated rotator angle at mid-point
-                                    'overhead': overhead # Store calculated overhead
-                                })
-                    
-                    if not visible_candidates:
-                        continue
-
-                    # Overlap Logic
-                    overlapping_candidates = []
-                    if observed_history:
-                        for cand in visible_candidates:
-                            is_overlapping = False
-                            for hist_coord in observed_history:
-                                if cand['coord'].separation(hist_coord).deg < overlap_sep:
-                                    is_overlapping = True
-                                    break
-                            if is_overlapping:
-                                overlapping_candidates.append(cand)
-                    
-                    if overlapping_candidates:
-                        best_candidate_for_timeslot = max(overlapping_candidates, key=lambda x: x['teff'])
-                        print(f"  [Overlap][P{priority}] Selected {best_candidate_for_timeslot['info']['id']} (teff: {best_candidate_for_timeslot['teff']:.2f})")
-                    else:
-                        best_score = -np.inf
-                        for cand in visible_candidates:
-                            if current_pointing is None:
-                                slew_dist = 0
-                            else:
-                                slew_dist = current_pointing.separation(cand['coord']).deg
-                            score = cand['alt'] - slew_penalty * slew_dist
-                            
-                            if score > best_score:
-                                best_score = score
-                                best_candidate_for_timeslot = cand
+                        gap_before = start_slot - nearest_end_before
+                        gap_after = nearest_start_after - end_slot
                         
-                        if best_candidate_for_timeslot:
-                             print(f"  [Score][P{priority}] Selected {best_candidate_for_timeslot['info']['id']} (Alt: {best_candidate_for_timeslot['alt']:.1f})")
+                        shifted = False
+                        
+                        # 1. Close small gaps (< 80 min) completely
+                        if 0 < gap_before.to(u.min).value < min_auto_gap.to(u.min).value:
+                            print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
+                            start_slot = nearest_end_before
+                            end_slot = start_slot + total_duration
+                            shifted = True
+                        
+                        # 2. Optimize large gaps (> 80 min) to avoid wasted tail
+                        elif gap_before.to(u.min).value >= min_auto_gap.to(u.min).value:
+                            remainder = (gap_before.to(u.min).value) % est_auto_len.to(u.min).value
+                            # If remainder is significant but useless (e.g., < 20 min), shift earlier to consume it
+                            # A valid Auto block needs ~20 min. If we have 15 min left, it's waste.
+                            # We shift Manual block earlier by 'remainder' so the gap becomes a multiple of est_auto_len.
+                            if 0 < remainder < (min_overhead + 15*u.min).to(u.min).value:
+                                 shift_amount = remainder * u.min
+                                 print(f"    - [Adjust] Optimizing large gap before {ppc_code}. Remainder {remainder:.1f}m. Shifting earlier by {shift_amount:.1f}")
+                                 start_slot = start_slot - shift_amount
+                                 end_slot = start_slot + total_duration
+                                 shifted = True
 
-                    if best_candidate_for_timeslot:
-                        break # Found best in this priority
+                        # Then check 'after' gap (using new end_slot)
+                        if not shifted:
+                            gap_after = nearest_start_after - end_slot
+                            if 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
+                                 # Check if shifting later fits
+                                 potential_start = nearest_start_after - total_duration
+                                 if potential_start >= nearest_end_before:
+                                     print(f"    - [Adjust] Closing small gap after {ppc_code} ({gap_after.to(u.min):.1f}). Shifting to {potential_start.iso}")
+                                     start_slot = potential_start
+                                     end_slot = nearest_start_after
+                                     shifted = True
+                            # Optimize large gap after? (Maybe less critical as it pushes into end of night/next block)
+                        
+                        reservations.append((start_slot, end_slot, target_info, nframes))
+                        mid_alt = observer.altaz(start_slot + total_duration/2, target_info['target']).alt.deg
+                        print(f"    - Scheduled {ppc_code} ({nframes} frames) at {start_slot.iso} (Avg Alt: {mid_alt:.1f})")
+                        target_info['observed'] = True # Mark as observed
+                    else:
+                        print(f"    - [Warning] Could not find slot for {ppc_code}!")
+
+            # Sort reservations by start time
+            reservations.sort(key=lambda x: x[0])
+            
+            # --- 1b. Compact Manual Schedule (Post-processing) ---
+            # Close gaps < min_auto_gap between manual blocks to prevent single Auto frames
+            # min_auto_gap is ~80 min
+            min_auto_gap = 4 * (min_overhead + 15 * u.min)
+            
+            # 1. Check Gap from Night Start to First Block
+            if reservations:
+                r_start, r_end, r_target, r_nframes = reservations[0]
+                gap = r_start - start_time
+                if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
+                    # Try to shift earlier to start_time
+                    new_start = start_time
+                    new_end = new_start + (r_end - r_start)
+                    
+                    # Verify Rotator Constraint
+                    # Check mid-point
+                    t_mid = new_start + (new_end - new_start)/2
+                    pa = observer.parallactic_angle(t_mid, r_target['target']).to(u.deg).value
+                    rot = Angle((pa + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                    
+                    if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
+                        print(f"    - [Compact] Closing start gap ({gap.to(u.min):.1f}). Shifting {r_target['id']} to {new_start.iso}")
+                        reservations[0] = (new_start, new_end, r_target, r_nframes)
+
+            # 2. Check Gaps between Blocks
+            for i in range(len(reservations) - 1):
+                curr_start, curr_end, curr_target, curr_nframes = reservations[i]
+                next_start, next_end, next_target, next_nframes = reservations[i+1]
                 
-                if best_candidate_for_timeslot:
-                    # Case 3a: An auto target was successfully scheduled
-                    best_target = best_candidate_for_timeslot['info']
-                    best_alt = best_candidate_for_timeslot['alt']
-                    best_airmass = best_candidate_for_timeslot['airmass']
-                    final_overhead = best_candidate_for_timeslot['overhead']
+                gap = next_start - curr_end
+                
+                if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
+                    # Try to shift 'next' earlier to 'curr_end'
+                    duration = next_end - next_start
+                    new_start = curr_end
+                    new_end = new_start + duration
                     
-                    exptime = best_target['exptime'] * u.s
+                    # Verify Rotator Constraint
+                    t_mid = new_start + duration/2
+                    pa = observer.parallactic_angle(t_mid, next_target['target']).to(u.deg).value
+                    rot = Angle((pa + next_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
                     
-                    # Schedule starts after overhead
-                    obs_start_time = current_time + final_overhead
-                    obs_end_time = obs_start_time + exptime
-                    
-                    # Calculate Rotator Angle (Start/End)
-                    pa_start = observer.parallactic_angle(obs_start_time, best_target['target']).to(u.deg).value
-                    rot_start = Angle((pa_start + best_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-                    
-                    pa_end = observer.parallactic_angle(obs_end_time, best_target['target']).to(u.deg).value
-                    rot_end = Angle((pa_end + best_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                    if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
+                        print(f"    - [Compact] Closing inter-block gap ({gap.to(u.min):.1f}). Shifting {next_target['id']} to {new_start.iso}")
+                        reservations[i+1] = (new_start, new_end, next_target, next_nframes)
+                        # Update local variable for next iteration? No, next iteration uses i+1 as curr.
+                        # But we updated reservations list, so next iter will see new values. Correct.
 
-                    # Calculate LST
-                    lst = observer.local_sidereal_time(obs_start_time).to_string(sep=':', precision=0)
-                    
-                    # Moon Stats
-                    moon_coord = get_body('moon', obs_start_time, location=observer.location)
-                    #moon_sep = best_target['target'].coord.separation(moon_coord).deg
-                    moon_sep = moon_coord.separation(best_target['target'].coord).deg
-                    moon_altaz_obj = observer.altaz(obs_start_time, moon_coord)
-                    moon_alt = moon_altaz_obj.alt.deg
-                    moon_illum = observer.moon_illumination(obs_start_time)
-                    
-                    # Teff (Already calculated as best_candidate_for_timeslot['teff'])
+            # Mark reserved manual targets as observed
+            for r_start, r_end, r_target, r_nframes in reservations:
+                r_target['observed'] = True # Mark as observed for greedy algorithm
 
-                    schedule.append({
-                        'night': night_idx + 1,
-                        'target': best_target['id'],
-                        'start_time': obs_start_time.iso, # Actual observation start time
-                        'end_time': obs_end_time.iso,
-                        'lst': lst,
-                        'moon_sep': moon_sep,
-                        'moon_illum': moon_illum,
-                        'moon_alt': moon_alt,
-                        'teff': best_candidate_for_timeslot['teff'],
-                        'rot_start': rot_start,
-                        'rot_end': rot_end,
-                        'altitude': best_alt,
-                        'airmass': best_airmass,
-                        'exptime': best_target['exptime'],
-                        'ra': best_target['target'].coord.ra.deg,
-                        'dec': best_target['target'].coord.dec.deg,
-                        'slew_time': final_overhead.to(u.s).value, # Log slew time as seconds
-                        'note': 'Auto'
-                    })
+            # --- 2. Fill Gaps with Greedy Algorithm ---
+            while current_time < end_time:
+                
+                # Check for upcoming reservation
+                active_reservation = None
+                next_reservation_start = end_time
+                
+                for r_start, r_end, r_target, r_nframes in reservations:
+                    if r_start <= current_time < r_end:
+                        active_reservation = (r_start, r_end, r_target, r_nframes)
+                        break
+                    if r_start > current_time:
+                        next_reservation_start = r_start
+                        break
+                
+                # Case 1: Current time is within an active manual reservation
+                if active_reservation:
+                    r_start, r_end, r_target, r_nframes = active_reservation
                     
-                    best_target['observed'] = True
-                    current_pointing = best_target['target'].coord
-                    current_rotator_angle = best_candidate_for_timeslot['rotator_angle']
-                    current_time = obs_end_time # Advance current_time to the end of observation
-                    observed_history.append(current_pointing)
+                    # Align current_time if we drifted slightly or skipped
+                    # We log individual frames
+                    base_time = max(current_time, r_start)
+                    
+                    for i in range(r_nframes):
+                        f_start = r_start + i * manual_block_len
+                        f_end = f_start + manual_block_len
+                        
+                        # Don't log if it's already past (shouldn't happen with proper logic)
+                        if f_end <= current_time: 
+                            continue
+
+                        mid_time = f_start + manual_block_len/2
+                        altaz = observer.altaz(mid_time, r_target['target'])
+                        
+                        # Calculate Rotator Angle (Start/End)
+                        pa_start = observer.parallactic_angle(f_start, r_target['target']).to(u.deg).value
+                        rot_start = Angle((pa_start + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                        
+                        pa_end = observer.parallactic_angle(f_end, r_target['target']).to(u.deg).value
+                        rot_end = Angle((pa_end + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+
+                        # Calculate LST
+                        lst = observer.local_sidereal_time(f_start).to_string(sep=':', precision=0)
+                        
+                        # Moon Stats
+                        moon_coord = get_body('moon', f_start, location=observer.location)
+                        #moon_sep = r_target['target'].coord.separation(moon_coord).deg
+                        moon_sep = moon_coord.separation(r_target['target'].coord).deg
+
+                        moon_altaz_obj = observer.altaz(f_start, moon_coord)
+                        moon_alt = moon_altaz_obj.alt.deg
+                        moon_illum = observer.moon_illumination(f_start)
+                        
+                        # Teff
+                        sun = get_body('sun', f_start, location=observer.location)
+                        moon_phase = moon_coord.separation(sun, origin_mismatch="ignore")
+                        teff = calculate_teff(observer, r_target['target'].coord, altaz.alt.deg, altaz.secz, moon_coord, moon_altaz_obj, moon_phase, mbm)
+
+                        schedule.append({
+                            'night': night_idx + 1,
+                            'target': r_target['id'],
+                            'start_time': f_start.iso,
+                            'end_time': f_end.iso,
+                            'lst': lst,
+                            'moon_sep': moon_sep,
+                            'moon_illum': moon_illum,
+                            'moon_alt': moon_alt,
+                            'teff': teff,
+                            'rot_start': rot_start,
+                            'rot_end': rot_end,
+                            'altitude': altaz.alt.deg,
+                            'airmass': altaz.secz,
+                            'exptime': 900, # 15 min assumption
+                            'ra': r_target['target'].coord.ra.deg,
+                            'dec': r_target['target'].coord.dec.deg,
+                            'note': 'Manual'
+                        })
+                        if r_target['target'].coord not in observed_history:
+                            observed_history.append(r_target['target'].coord)
+                    
+                    current_time = r_end # Advance current_time to the end of the manual block
+                    current_pointing = r_target['target'].coord
+                    # Update rotator angle (rot was calculated for the last frame mid-time, roughly correct for end state)
+                    current_rotator_angle = rot_end
+                
+                # Case 2: Gap is too short for any observation, advance current_time past the gap
+                elif (next_reservation_start - current_time) < (min_overhead + manual_readout_exptime):
+                    current_time = next_reservation_start
+                
+                # Case 3: There is a valid gap to fill with greedy targets
                 else:
-                    # Case 3b: No suitable auto target found in the gap, advance current_time by a step
-                    current_time += min_overhead / 2 # Advance by a smaller step, e.g., 2.5 min, to find next opportunity
+                    best_candidate_for_timeslot = None
+                    
+                    moon_coord = get_body('moon', current_time, location=observer.location)
+                    moon_altaz = observer.altaz(current_time, moon_coord)
+                    sun = get_body('sun', current_time, location=observer.location)
+                    moon_phase = moon_coord.separation(sun, origin_mismatch="ignore")
+
+                    # Current telescope state for slew calc
+                    if current_pointing is not None:
+                        cur_altaz_coord = SkyCoord(current_pointing)
+                        cur_altaz = observer.altaz(current_time, cur_altaz_coord)
+                    else:
+                        cur_altaz = None
+
+                    # Iterate priorities
+                    for priority in greedy_priorities:
+                        if verbose:
+                            print(f"[Verbose] Checking Priority {priority}")
+
+                        # Collect targets to check
+                        targets_to_check = [t for t in all_targets.values() if not t['observed'] and t['priority'] == priority]
+                        
+                        if not targets_to_check:
+                            continue
+
+                        # Prepare args for worker
+                        worker_args = []
+                        for t in targets_to_check:
+                            worker_args.append((
+                                t, current_time, current_pointing, cur_altaz, current_rotator_angle, 
+                                next_reservation_start, observer, slew_params, min_overhead, 
+                                max_airmass, rot_min, rot_max, min_teff, 
+                                moon_coord, moon_altaz, moon_phase, mbm, verbose
+                            ))
+                        
+                        # Run parallel check
+                        # Using chunksize to improve performance for many small tasks
+                        results = executor.map(check_visibility_worker, worker_args, chunksize=20)
+                        
+                        visible_candidates = [r for r in results if r is not None]
+                        
+                        if not visible_candidates:
+                            continue
+
+                        # Overlap Logic
+                        overlapping_candidates = []
+                        if observed_history:
+                            for cand in visible_candidates:
+                                is_overlapping = False
+                                for hist_coord in observed_history:
+                                    if cand['coord'].separation(hist_coord).deg < overlap_sep:
+                                        is_overlapping = True
+                                        break
+                                if is_overlapping:
+                                    overlapping_candidates.append(cand)
+                        
+                        if overlapping_candidates:
+                            best_candidate_for_timeslot = max(overlapping_candidates, key=lambda x: x['teff'])
+                            print(f"  [Overlap][P{priority}] Selected {best_candidate_for_timeslot['info']['id']} (teff: {best_candidate_for_timeslot['teff']:.2f})")
+                        else:
+                            best_score = -np.inf
+                            for cand in visible_candidates:
+                                if current_pointing is None:
+                                    slew_dist = 0
+                                else:
+                                    slew_dist = current_pointing.separation(cand['coord']).deg
+                                score = cand['alt'] - slew_penalty * slew_dist
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_candidate_for_timeslot = cand
+                            
+                            if best_candidate_for_timeslot:
+                                 print(f"  [Score][P{priority}] Selected {best_candidate_for_timeslot['info']['id']} (Alt: {best_candidate_for_timeslot['alt']:.1f})")
+
+                        if best_candidate_for_timeslot:
+                            break # Found best in this priority                
+                    
+                    if best_candidate_for_timeslot:
+                        # Case 3a: An auto target was successfully scheduled
+                        best_target = best_candidate_for_timeslot['info']
+                        best_alt = best_candidate_for_timeslot['alt']
+                        best_airmass = best_candidate_for_timeslot['airmass']
+                        final_overhead = best_candidate_for_timeslot['overhead']
+                        
+                        exptime = best_target['exptime'] * u.s
+                        
+                        # Schedule starts after overhead
+                        obs_start_time = current_time + final_overhead
+                        obs_end_time = obs_start_time + exptime
+                        
+                        # Calculate Rotator Angle (Start/End)
+                        pa_start = observer.parallactic_angle(obs_start_time, best_target['target']).to(u.deg).value
+                        rot_start = Angle((pa_start + best_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                        
+                        pa_end = observer.parallactic_angle(obs_end_time, best_target['target']).to(u.deg).value
+                        rot_end = Angle((pa_end + best_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+
+                        # Calculate LST
+                        lst = observer.local_sidereal_time(obs_start_time).to_string(sep=':', precision=0)
+                        
+                        # Moon Stats
+                        moon_coord = get_body('moon', obs_start_time, location=observer.location)
+                        #moon_sep = best_target['target'].coord.separation(moon_coord).deg
+                        moon_sep = moon_coord.separation(best_target['target'].coord).deg
+                        moon_altaz_obj = observer.altaz(obs_start_time, moon_coord)
+                        moon_alt = moon_altaz_obj.alt.deg
+                        moon_illum = observer.moon_illumination(obs_start_time)
+                        
+                        # Teff (Already calculated as best_candidate_for_timeslot['teff'])
+
+                        schedule.append({
+                            'night': night_idx + 1,
+                            'target': best_target['id'],
+                            'start_time': obs_start_time.iso, # Actual observation start time
+                            'end_time': obs_end_time.iso,
+                            'lst': lst,
+                            'moon_sep': moon_sep,
+                            'moon_illum': moon_illum,
+                            'moon_alt': moon_alt,
+                            'teff': best_candidate_for_timeslot['teff'],
+                            'rot_start': rot_start,
+                            'rot_end': rot_end,
+                            'altitude': best_alt,
+                            'airmass': best_airmass,
+                            'exptime': best_target['exptime'],
+                            'ra': best_target['target'].coord.ra.deg,
+                            'dec': best_target['target'].coord.dec.deg,
+                            'slew_time': final_overhead.to(u.s).value, # Log slew time as seconds
+                            'note': 'Auto'
+                        })
+                        
+                        # Update the master target list, as best_target is a copy from the worker
+                        all_targets[best_target['id']]['observed'] = True
+                        
+                        best_target['observed'] = True
+                        current_pointing = best_target['target'].coord
+                        current_rotator_angle = best_candidate_for_timeslot['rotator_angle']
+                        current_time = obs_end_time # Advance current_time to the end of observation
+                        observed_history.append(current_pointing)
+                    else:
+                        # Case 3b: No suitable auto target found in the gap, advance current_time by a step
+                        current_time += min_overhead / 2 # Advance by a smaller step, e.g., 2.5 min, to find next opportunity
+    finally:
+        executor.shutdown()
                 
     return schedule
 
@@ -815,7 +885,7 @@ def main():
     
     # Load targets
     print("Loading targets...")
-    all_targets = load_all_targets(priorities)
+    all_targets = load_all_targets_from_ppcList(priorities)
     print(f"Loaded {len(all_targets)} targets.")
     
     # Load manual schedule
@@ -823,7 +893,7 @@ def main():
     manual_schedule = load_manual_schedule('manual_allocation.csv')
     
     # Load dates
-    nights = read_obsdates('obsdates_2025Nov.txt', observer, skip_days=8)
+    nights = read_obsdates('obsdates_2026Jan.txt', observer)
     print(f"Loaded {len(nights)} nights.")
     
     # Run scheduler

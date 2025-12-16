@@ -7,23 +7,27 @@ from astropy.coordinates import EarthLocation, SkyCoord
 from astropy.time import Time
 from astroplan import FixedTarget, Observer
 from astropy.table import Table
+import pandas as pd
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
 
 def read_priorities(filename):
     """
-    Read priorities from an ECSV file using astropy.
-    Returns a dictionary mapping ppc_code to ppc_priority.
+    Read priorities from a ppcList.ecsv file.
     """
+    priorities = {}
     try:
-        table = Table.read(filename) # Removed format='ecsv'
-        # Ensure priorities are integers
-        priorities = {row['ppc_code']: int(row['ppc_priority']) for row in table}
-        return priorities
+        df = Table.read(filename, format='ascii.ecsv').to_pandas()
+        for _, row in df.iterrows():
+            # Check if 'ppc_priority' column exists and is not null
+            if 'ppc_priority' in row and pd.notna(row['ppc_priority']):
+                priorities[row['ppc_code']] = int(row['ppc_priority'])
+    except FileNotFoundError:
+        print(f"Warning: Priority file {filename} not found.")
     except Exception as e:
-        print(f"Error reading priorities file {filename}: {e}")
-        return {}
+        print(f"Error reading priorities from {filename}: {e}")
+    return priorities
 
 def setup_observer():
     """
@@ -56,6 +60,27 @@ def read_targets(filename, priorities):
                 'observed': False,
                 'priority': priority
             })
+    return targets
+
+def read_targets_from_ppcList(filename, priorities):
+    """
+    Read targets from a ECSV file.
+    Returns a list of dictionaries containing target info and an astroplan FixedTarget.
+    """
+    targets = []
+    df = Table.read(filename, format='ascii.ecsv').to_pandas()
+    for _, row in df.iterrows():
+        ppc_code = row['ppc_code']
+        priority = priorities.get(ppc_code, 99)
+        coord = SkyCoord(ra=float(row['ppc_ra'])*u.deg, dec=float(row['ppc_dec'])*u.deg)
+        target = FixedTarget(coord=coord, name=ppc_code)
+        targets.append({
+            'id': ppc_code,
+            'target': target,
+            'exptime': float(row['ppc_exptime']),
+            'observed': False,
+            'priority': priority
+        })
     return targets
 
 def parse_time(date_str, time_str, observer, is_end=False):

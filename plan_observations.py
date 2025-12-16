@@ -363,6 +363,7 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
     # Config parameters
     rot_min = config['constraints']['rotator_min']
     rot_max = config['constraints']['rotator_max']
+    max_airmass = config['constraints']['max_airmass']
     adj_window = config['scheduling']['adjacency_bonus_window_sec']
     adj_bonus = config['scheduling']['adjacency_bonus_score']
     
@@ -424,8 +425,13 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
         if rotator_angle < rot_min or rotator_angle > rot_max:
             continue # Skip this slot as it's outside the allowed rotator angle range
             
-        # Calculate altitude at mid-point
-        alt = observer.altaz(t_mid, target_info['target']).alt.deg
+        # Calculate altitude/airmass at mid-point
+        altaz = observer.altaz(t_mid, target_info['target'])
+        alt = altaz.alt.deg
+        airmass = altaz.secz
+        
+        if airmass > max_airmass:
+            continue
         
         # Adjacency Bonus
         bonus = 0
@@ -508,36 +514,74 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                 
                 max_ge_end_time = start_time # Track end of GE observations
                 
-                for req in sorted_requests:
-                    ppc_code = req['ppc_code']
-                    nframes = req['nframes']
+                # Helper to check constraints for a specific time slot
+                def check_slot_constraints(t_start, t_end, t_info):
+                    t_mid = t_start + (t_end - t_start)/2
+                    # Rotator
+                    pa = observer.parallactic_angle(t_mid, t_info['target']).to(u.deg).value
+                    rot = Angle((pa + t_info['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+                    if not (config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']):
+                        return False
+                    # Airmass
+                    altaz = observer.altaz(t_mid, t_info['target'])
+                    if altaz.alt.deg <= 0: return False
+                    if altaz.secz > config['constraints']['max_airmass']:
+                         return False
+                    return True
+                
+                # Group requests by target proximity to optimize contiguous blocks
+                grouped_requests = []
+                if sorted_requests:
+                    current_group = [sorted_requests[0]]
+                    first_info = all_targets[sorted_requests[0]['ppc_code']]
+                    current_coord = first_info['target'].coord
                     
-                    if ppc_code not in all_targets:
-                        print(f"  [Error] Manual target {ppc_code} not found in database.")
-                        continue
+                    for i in range(1, len(sorted_requests)):
+                        req = sorted_requests[i]
+                        info = all_targets[req['ppc_code']]
+                        coord = info['target'].coord
+                        
+                        if current_coord.separation(coord) < 5.0 * u.deg:
+                            current_group.append(req)
+                        else:
+                            grouped_requests.append(current_group)
+                            current_group = [req]
+                            current_coord = coord
+                    grouped_requests.append(current_group)
+                
+                # Loop over groups
+                for group in grouped_requests:
+                    # Representative info (first in group)
+                    rep_req = group[0]
+                    rep_ppc_code = rep_req['ppc_code']
+                    rep_info = all_targets[rep_ppc_code]
                     
-                    target_info = all_targets[ppc_code]
-                    total_duration = nframes * manual_block_len
+                    # Calculate total duration
+                    group_nframes = sum(r['nframes'] for r in group)
+                    total_duration = group_nframes * manual_block_len
                     
-                    # Current busy slots from reservations
+                    # Determine search start (Constraint Logic)
+                    group_has_ga = any('SSP_GA' in r['ppc_code'] for r in group)
+                    search_start = start_time
+                    if enforce_ge_before_ga and group_has_ga:
+                         search_start = max(start_time, max_ge_end_time)
+                    
+                    # Find slot for combined block
                     busy = [(r[0], r[1]) for r in reservations]
                     
-                    # Determine search start time
-                    search_start = start_time
-                    if enforce_ge_before_ga and 'SSP_GA' in ppc_code:
-                        search_start = max(start_time, max_ge_end_time)
-                    
-                    # Align search grid to 1 min to allow fine-tuning, but ensure block length consistency
-                    # Note: find_optimal_slot candidates will be spaced by time_step
-                    start_slot = find_optimal_slot(observer, target_info, total_duration, search_start, end_time, busy, 1*u.min, target_info['ppc_pa'], config)
+                    # Using representative target for optimization
+                    start_slot = find_optimal_slot(observer, rep_info, total_duration, search_start, end_time, busy, 1*u.min, rep_info['ppc_pa'], config)
                     
                     if start_slot:
                         # --- Gap Check Logic ---
+                        # Use variable names consistent with logic below
+                        ppc_code = rep_ppc_code + " (Group)"
+                        target_info = rep_info # For constraints check
+                        
                         # Define minimum gap for Auto observations (4 frames)
                         min_auto_gap = 4 * (min_overhead + 15 * u.min) # ~80 min
                         
                         # Estimate effective Auto block length (including avg slew)
-                        # Overhead (5m) + Exp (15m) + Slew (~1m) = 21m
                         est_auto_len = min_overhead + 15 * u.min + 1 * u.min
                         
                         # Calculate potential end slot
@@ -562,9 +606,9 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         # 1. Close small gaps (< 80 min) completely
                         if 0 < gap_before.to(u.min).value < min_auto_gap.to(u.min).value:
                             # Ensure we don't shift before max_ge_end_time if it's a GA target
-                            if enforce_ge_before_ga and 'SSP_GA' in ppc_code and nearest_end_before < max_ge_end_time:
-                                pass # Cannot shift into forbidden zone (though nearest_end_before should be >= max_ge_end_time usually)
-                            else:
+                            if enforce_ge_before_ga and 'SSP_GA' in rep_ppc_code and nearest_end_before < max_ge_end_time:
+                                pass 
+                            elif check_slot_constraints(nearest_end_before, nearest_end_before + total_duration, target_info):
                                 print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
                                 start_slot = nearest_end_before
                                 end_slot = start_slot + total_duration
@@ -573,18 +617,18 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         # 2. Optimize large gaps (> 80 min) to avoid wasted tail
                         elif gap_before.to(u.min).value >= min_auto_gap.to(u.min).value:
                             remainder = (gap_before.to(u.min).value) % est_auto_len.to(u.min).value
-                            # If remainder is significant but useless (e.g., < 20 min), shift earlier to consume it
-                            # A valid Auto block needs ~20 min. If we have 15 min left, it's waste.
-                            # We shift Manual block earlier by 'remainder' so the gap becomes a multiple of est_auto_len.
                             if 0 < remainder < (min_overhead + 15*u.min).to(u.min).value:
                                  shift_amount = remainder * u.min
                                  new_start = start_slot - shift_amount
                                  
                                  # Constraint check
                                  valid_shift = True
-                                 if enforce_ge_before_ga and 'SSP_GA' in ppc_code:
+                                 if enforce_ge_before_ga and 'SSP_GA' in rep_ppc_code:
                                      if new_start < max_ge_end_time:
                                          valid_shift = False
+                                 
+                                 if valid_shift and not check_slot_constraints(new_start, new_start + total_duration, target_info):
+                                     valid_shift = False
                                          
                                  if valid_shift:
                                      print(f"    - [Adjust] Optimizing large gap before {ppc_code}. Remainder {remainder:.1f}m. Shifting earlier by {shift_amount:.1f}")
@@ -598,26 +642,35 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                             if 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
                                  # Check if shifting later fits
                                  potential_start = nearest_start_after - total_duration
-                                 if potential_start >= nearest_end_before: # And check overlap/bounds
-                                     # Note: Shifting later doesn't violate "GA after GE" if it was already valid
-                                     print(f"    - [Adjust] Closing small gap after {ppc_code} ({gap_after.to(u.min):.1f}). Shifting to {potential_start.iso}")
-                                     start_slot = potential_start
-                                     end_slot = nearest_start_after
-                                     shifted = True
-                            # Optimize large gap after? (Maybe less critical as it pushes into end of night/next block)
-                        
-                        reservations.append((start_slot, end_slot, target_info, nframes))
-                        mid_alt = observer.altaz(start_slot + total_duration/2, target_info['target']).alt.deg
-                        print(f"    - Scheduled {ppc_code} ({nframes} frames) at {start_slot.iso} (Avg Alt: {mid_alt:.1f})")
-                        target_info['observed'] = True # Mark as observed
-                        
-                        # Update max_ge_end_time
-                        if enforce_ge_before_ga and 'SSP_GE' in ppc_code:
-                            if end_slot > max_ge_end_time:
-                                max_ge_end_time = end_slot
-                                
+                                 if potential_start >= nearest_end_before: 
+                                     if check_slot_constraints(potential_start, nearest_start_after, target_info):
+                                         print(f"    - [Adjust] Closing small gap after {ppc_code} ({gap_after.to(u.min):.1f}). Shifting to {potential_start.iso}")
+                                         start_slot = potential_start
+                                         end_slot = nearest_start_after
+                                         shifted = True
+
+                        # Decompose group and schedule individual targets
+                        curr_slot_start = start_slot
+                        for req in group:
+                            req_code = req['ppc_code']
+                            req_info = all_targets[req_code]
+                            req_frames = req['nframes']
+                            req_dur = req_frames * manual_block_len
+                            
+                            req_end = curr_slot_start + req_dur
+                            reservations.append((curr_slot_start, req_end, req_info, req_frames))
+                            
+                            mid_alt = observer.altaz(curr_slot_start + req_dur/2, req_info['target']).alt.deg
+                            print(f"    - Scheduled {req_code} ({req_frames} frames) at {curr_slot_start.iso} (Avg Alt: {mid_alt:.1f})")
+                            req_info['observed'] = True 
+                            
+                            if enforce_ge_before_ga and 'SSP_GE' in req_code:
+                                if req_end > max_ge_end_time:
+                                    max_ge_end_time = req_end
+                                    
+                            curr_slot_start = req_end
                     else:
-                        print(f"    - [Warning] Could not find slot for {ppc_code}!")
+                        print(f"    - [Warning] Could not find slot for group starting with {rep_ppc_code}!")
 
             # Sort reservations by start time
             reservations.sort(key=lambda x: x[0])
@@ -636,13 +689,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     new_start = start_time
                     new_end = new_start + (r_end - r_start)
                     
-                    # Verify Rotator Constraint
-                    # Check mid-point
-                    t_mid = new_start + (new_end - new_start)/2
-                    pa = observer.parallactic_angle(t_mid, r_target['target']).to(u.deg).value
-                    rot = Angle((pa + r_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-                    
-                    if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
+                    if check_slot_constraints(new_start, new_end, r_target):
                         print(f"    - [Compact] Closing start gap ({gap.to(u.min):.1f}). Shifting {r_target['id']} to {new_start.iso}")
                         reservations[0] = (new_start, new_end, r_target, r_nframes)
 
@@ -659,12 +706,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     new_start = curr_end
                     new_end = new_start + duration
                     
-                    # Verify Rotator Constraint
-                    t_mid = new_start + duration/2
-                    pa = observer.parallactic_angle(t_mid, next_target['target']).to(u.deg).value
-                    rot = Angle((pa + next_target['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
-                    
-                    if config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']:
+                    if check_slot_constraints(new_start, new_end, next_target):
                         print(f"    - [Compact] Closing inter-block gap ({gap.to(u.min):.1f}). Shifting {next_target['id']} to {new_start.iso}")
                         reservations[i+1] = (new_start, new_end, next_target, next_nframes)
                         # Update local variable for next iteration? No, next iteration uses i+1 as curr.

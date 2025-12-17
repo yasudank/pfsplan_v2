@@ -712,6 +712,46 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         # Update local variable for next iteration? No, next iteration uses i+1 as curr.
                         # But we updated reservations list, so next iter will see new values. Correct.
 
+            # 3. Check Gap from Last Block to Night End
+            if reservations:
+                last_r_start, last_r_end, _, _ = reservations[-1]
+                gap = end_time - last_r_end
+                
+                if 0 < gap.to(u.min).value < min_auto_gap.to(u.min).value:
+                    # Identify contiguous block from the end
+                    indices_to_shift = [len(reservations) - 1]
+                    for i in range(len(reservations) - 2, -1, -1):
+                        curr_end = reservations[i][1]
+                        next_start = reservations[i+1][0]
+                        # If gap between blocks is negligible (was closed or already small)
+                        # Step 2 closes gaps < min_auto_gap, so connected blocks should have 0 gap.
+                        if (next_start - curr_end).to(u.min).value < 1.0: # 1 min tolerance
+                             indices_to_shift.insert(0, i)
+                        else:
+                             break
+                    
+                    # Check constraints for all blocks in cluster
+                    valid_shift = True
+                    shift_amount = gap # Shift exactly to end
+                    
+                    # Check if shifting all these targets is valid
+                    for idx in indices_to_shift:
+                        r_start, r_end, r_target, r_nframes = reservations[idx]
+                        new_start = r_start + shift_amount
+                        new_end = r_end + shift_amount
+                        if not check_slot_constraints(new_start, new_end, r_target):
+                            valid_shift = False
+                            print(f"    - [Compact] Cannot shift block ending with {reservations[-1][2]['id']} because {r_target['id']} would violate constraints.")
+                            break
+                    
+                    if valid_shift:
+                         print(f"    - [Compact] Closing end gap ({gap.to(u.min):.1f}). Shifting {len(indices_to_shift)} blocks to end of night.")
+                         for idx in indices_to_shift:
+                             r_start, r_end, r_target, r_nframes = reservations[idx]
+                             new_start = r_start + shift_amount
+                             new_end = r_end + shift_amount
+                             reservations[idx] = (new_start, new_end, r_target, r_nframes)
+
             # Mark reserved manual targets as observed
             for r_start, r_end, r_target, r_nframes in reservations:
                 r_target['observed'] = True # Mark as observed for greedy algorithm

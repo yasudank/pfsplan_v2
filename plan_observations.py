@@ -367,6 +367,15 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
     adj_window = config['scheduling']['adjacency_bonus_window_sec']
     adj_bonus = config['scheduling']['adjacency_bonus_score']
     
+    # Debug statistics
+    fail_stats = {
+        'overlap': 0,
+        'rotator': 0,
+        'airmass': 0,
+        'altitude': 0,
+        'total_checked': 0
+    }
+
     # 1. Generate candidate times (base grid)
     candidates = []
     curr = night_start
@@ -402,10 +411,15 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
                 is_valid = False
                 break
         
+        fail_stats['total_checked'] += 1
         if is_valid:
             valid_times.append(t_start)
+        else:
+            fail_stats['overlap'] += 1
 
     if not valid_times:
+        if fail_stats['total_checked'] > 0:
+            print(f"    - [Debug] {target_info['id']}: No valid slots found (checked {fail_stats['total_checked']}). All overlapped or out of bounds.")
         return None
 
     # Evaluate altitudes for valid slots
@@ -423,6 +437,7 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
 
         # Check instrument rotator angle constraint
         if rotator_angle < rot_min or rotator_angle > rot_max:
+            fail_stats['rotator'] += 1
             continue # Skip this slot as it's outside the allowed rotator angle range
             
         # Calculate altitude/airmass at mid-point
@@ -431,8 +446,13 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
         airmass = altaz.secz
         
         if airmass > max_airmass:
+            fail_stats['airmass'] += 1
             continue
         
+        if alt <= 0: # Check altitude > 0
+            fail_stats['altitude'] += 1
+            continue
+            
         # Adjacency Bonus
         bonus = 0
         for b_start, b_end in busy_slots:
@@ -443,10 +463,13 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
         score = alt + bonus
         
         # Only consider valid altitudes (and prefer higher score)
-        if alt > 0 and score > best_score:
+        if score > best_score:
             best_score = score
             best_time = t_start
             
+    if best_time is None:
+        print(f"    - [Debug] {target_info['id']}: Failed to find slot. Reasons: Overlap={fail_stats['overlap']}, Rotator={fail_stats['rotator']}, Airmass={fail_stats['airmass']}, Altitude={fail_stats['altitude']} (from {fail_stats['total_checked']} candidates).")
+
     return best_time
 
 def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbose=False):
@@ -493,26 +516,9 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                 print(f"  [Manual] Scheduling fixed targets for {hst_date_str}...")
                 manual_requests = manual_schedule[hst_date_str]
                 
-                # Check for GE and GA presence to enforce ordering
-                has_ge = any('SSP_GE' in r['ppc_code'] for r in manual_requests)
-                has_ga = any('SSP_GA' in r['ppc_code'] for r in manual_requests)
-                enforce_ge_before_ga = has_ge and has_ga
-
                 # Sort requests
-                # If enforcing order: GE (0) -> Others (1) -> GA (2)
-                # Then by ppc_code
-                def manual_sort_key(req):
-                    code = req['ppc_code']
-                    priority_group = 1 # Default
-                    if enforce_ge_before_ga:
-                        if 'SSP_GE' in code: priority_group = 0
-                        elif 'SSP_GA' in code: priority_group = 2
-                    return (priority_group, code)
-
-                # manual_requests is a list of dicts, so we can sort in place or create new list
-                sorted_requests = sorted(manual_requests, key=manual_sort_key)
-                
-                max_ge_end_time = start_time # Track end of GE observations
+                # Use requests in the order they appear in the CSV to preserve user intent
+                sorted_requests = manual_requests
                 
                 # Helper to check constraints for a specific time slot
                 def check_slot_constraints(t_start, t_end, t_info):
@@ -550,7 +556,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     grouped_requests.append(current_group)
                 
                 # Loop over groups
-                for group in grouped_requests:
+                for group_idx, group in enumerate(grouped_requests):
                     # Representative info (first in group)
                     rep_req = group[0]
                     rep_ppc_code = rep_req['ppc_code']
@@ -561,10 +567,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     total_duration = group_nframes * manual_block_len
                     
                     # Determine search start (Constraint Logic)
-                    group_has_ga = any('SSP_GA' in r['ppc_code'] for r in group)
                     search_start = start_time
-                    if enforce_ge_before_ga and group_has_ga:
-                         search_start = max(start_time, max_ge_end_time)
                     
                     # Find slot for combined block
                     busy = [(r[0], r[1]) for r in reservations]
@@ -605,10 +608,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         
                         # 1. Close small gaps (< 80 min) completely
                         if 0 < gap_before.to(u.min).value < min_auto_gap.to(u.min).value:
-                            # Ensure we don't shift before max_ge_end_time if it's a GA target
-                            if enforce_ge_before_ga and 'SSP_GA' in rep_ppc_code and nearest_end_before < max_ge_end_time:
-                                pass 
-                            elif check_slot_constraints(nearest_end_before, nearest_end_before + total_duration, target_info):
+                            if check_slot_constraints(nearest_end_before, nearest_end_before + total_duration, target_info):
                                 print(f"    - [Adjust] Closing small gap before {ppc_code} ({gap_before.to(u.min):.1f}). Shifting to {nearest_end_before.iso}")
                                 start_slot = nearest_end_before
                                 end_slot = start_slot + total_duration
@@ -623,11 +623,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                                  
                                  # Constraint check
                                  valid_shift = True
-                                 if enforce_ge_before_ga and 'SSP_GA' in rep_ppc_code:
-                                     if new_start < max_ge_end_time:
-                                         valid_shift = False
-                                 
-                                 if valid_shift and not check_slot_constraints(new_start, new_start + total_duration, target_info):
+                                 if not check_slot_constraints(new_start, new_start + total_duration, target_info):
                                      valid_shift = False
                                          
                                  if valid_shift:
@@ -639,7 +635,14 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                         # Then check 'after' gap (using new end_slot)
                         if not shifted:
                             gap_after = nearest_start_after - end_slot
-                            if 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
+                            
+                            should_check_gap_after = True
+                            # Avoid shifting to end of night if there are more manual groups to come
+                            # This prevents reversing the order of sequential groups
+                            if abs((nearest_start_after - end_time).to(u.s).value) < 1.0 and group_idx < len(grouped_requests) - 1:
+                                should_check_gap_after = False
+
+                            if should_check_gap_after and 0 < gap_after.to(u.min).value < min_auto_gap.to(u.min).value:
                                  # Check if shifting later fits
                                  potential_start = nearest_start_after - total_duration
                                  if potential_start >= nearest_end_before: 
@@ -664,10 +667,6 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                             print(f"    - Scheduled {req_code} ({req_frames} frames) at {curr_slot_start.iso} (Avg Alt: {mid_alt:.1f})")
                             req_info['observed'] = True 
                             
-                            if enforce_ge_before_ga and 'SSP_GE' in req_code:
-                                if req_end > max_ge_end_time:
-                                    max_ge_end_time = req_end
-                                    
                             curr_slot_start = req_end
                     else:
                         print(f"    - [Warning] Could not find slot for group starting with {rep_ppc_code}!")

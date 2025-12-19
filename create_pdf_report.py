@@ -12,17 +12,37 @@ from obs_utils import setup_observer
 import warnings
 import yaml
 import os
+from datetime import datetime
 
 # Suppress warnings
 warnings.filterwarnings('ignore')
 
-def create_pdf_report(csv_file, output_pdf):
+def create_pdf_report(csv_file, output_pdf=None):
     print(f"Reading schedule from {csv_file}...")
     try:
         df = pd.read_csv(csv_file)
     except FileNotFoundError:
         print(f"Error: {csv_file} not found.")
         return
+
+    # Determine filename and title suffix based on content and execution date
+    if not df.empty and 'start_time' in df.columns:
+        # Use the first timestamp to determine the month (HST)
+        t_start = Time(df['start_time'].iloc[0])
+        t_hst = t_start - 10 * u.hour
+        # Format: 2026Jan
+        period_str = t_hst.datetime.strftime('%Y%b')
+    else:
+        period_str = "UnknownPeriod"
+
+    exec_date_str = datetime.now().strftime('v%Y%m%d')
+    
+    # Construct filename: obsplan_2026Jan.v20251218.pdf
+    generated_filename = f"obsplan_{period_str}.{exec_date_str}.pdf"
+    
+    # Update output_pdf
+    output_pdf = generated_filename
+    print(f"Output filename set to: {output_pdf}")
 
     print("Loading configuration...")
     try:
@@ -91,7 +111,7 @@ def create_pdf_report(csv_file, output_pdf):
     )
 
     # --- Page 1: Cover / Visuals ---
-    elements.append(Paragraph("Observation Plan Report", title_style))
+    elements.append(Paragraph(f"Observation Plan Report - {period_str}", title_style))
     elements.append(Spacer(1, 0.5*cm))
     
     try:
@@ -367,4 +387,4 @@ def create_pdf_report(csv_file, output_pdf):
         print(f"Error building PDF: {e}")
 
 if __name__ == "__main__":
-    create_pdf_report('observation_schedule.csv', 'schedule_report.pdf')
+    create_pdf_report('observation_schedule.csv')

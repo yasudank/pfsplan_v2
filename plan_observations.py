@@ -1013,6 +1013,7 @@ def main():
     # Load targets
     print("Loading targets...")
     all_targets = load_all_targets_from_ppcList(priorities)
+    #xsall_targets = load_all_targets(priorities)
     print(f"Loaded {len(all_targets)} targets.")
     
     # Load manual schedule

@@ -4,13 +4,16 @@ This project provides a suite of Python tools for planning, scheduling, and visu
 
 ## Features
 
-- **Automated Scheduling**: Optimizes observation times based on target priority, visibility, and constraints (airmass, moon distance, etc.).
+- **Automated Scheduling**: Optimizes observation times based on target priority, visibility, and constraints (airmass, altitude, moon distance, etc.).
 - **Moon Brightness Modeling**: Includes a detailed model for calculating sky brightness contributions from the moon in various bands (`g`, `r`, `i`, `z`, `y`).
 - **Slew Time Calculation**: Estimates slew times for azimuth, elevation, and rotator movements to ensure realistic scheduling.
 - **Visualization**: Generates comprehensive plots, including:
   - Altitude vs. Time
   - Rotator Angle vs. Time
-  - Sky Coverage (Static and Animated)
+  - Sky Coverage (Single panel with dynamic RA range)
+  - Animated Sky Coverage Progress
+  - Observation Counts per Target (Stacked bars for GA/GE groups)
+- **PDF Reporting**: Automatically generates a structured PDF report with all plots and tabular schedules.
 - **Configurable**: Highly customizable parameters via `obs_config.yaml`.
 
 ## Prerequisites
@@ -18,6 +21,7 @@ This project provides a suite of Python tools for planning, scheduling, and visu
 - Python 3.10 or higher
 - Standard scientific Python stack (`numpy`, `pandas`, `matplotlib`)
 - Astronomy packages (`astropy`, `astroplan`, `pyerfa`)
+- PDF Generation: `reportlab`
 
 ## Installation
 
@@ -35,13 +39,15 @@ This project provides a suite of Python tools for planning, scheduling, and visu
 The main configuration file `obs_config.yaml` allows you to tweak various system parameters:
 
 *   **`slew`**: Slew speeds for azimuth, elevation, and rotator.
-*   **`constraints`**: Observational limits such as maximum airmass, minimum altitude, and rotator limits.
-*   **`scheduling`**: Parameters for the scheduler, including overhead times and bonuses for overlapping fields.
-
-### Input Files
-
-*   **Observation Dates**: Defined in text files like `obsdates_2025Nov.txt` (format: list of dates).
-*   **Target Lists**: CSV files containing target information (e.g., `CO_summary_reconfigure.csv`, `GA_summary_reconfigure.csv`).
+*   **`constraints`**: 
+    *   `max_airmass`: Standard limit (e.g., 1.6).
+    *   `max_airmass_relaxed`: Limit for a restricted number of frames (e.g., 2.2).
+    *   `max_relaxed_count`: Max frames allowed to use the relaxed airmass per night.
+    *   `max_altitude`: Upper altitude limit (e.g., 75.0°).
+    *   `rotator_min/max`: Instrument rotator angle limits.
+*   **`scheduling`**: 
+    *   `group_all_manual_daily`: If true, treats all manual targets in a day as one block.
+    *   `group_all_exclude_dates`: List of dates to skip the global daily grouping.
 
 ## Usage
 
@@ -50,10 +56,16 @@ The main configuration file `obs_config.yaml` allows you to tweak various system
 Run the main planning script to generate the observation schedule:
 
 ```bash
-python plan_observations.py
+python plan_observations.py [options]
 ```
 
-This script reads the configuration and target lists, processes the logic, and outputs the schedule to `observation_schedule.csv`.
+**Options:**
+*   `--config <file>`: Path to configuration file (default: `obs_config.yaml`).
+*   `--manual <file>`: Path to manual allocation CSV (default: `manual_allocation_2026Mar.csv`).
+*   `--obsdates <file>`: Path to observation dates text file (default: `obsdates_2026Mar.txt`).
+*   `--group-all`: Treat all manual targets for a day as one block, regardless of prefix.
+*   `--exclude-dates <dates>`: Comma-separated list of dates (YYYY-MM-DD) to exclude from `--group-all`.
+*   `--verbose-slew`: Enable verbose output for slew time calculation details.
 
 ### 2. Visualize Schedule
 
@@ -63,50 +75,38 @@ After generating the schedule, run the plotting script to create visual reports:
 python plot_schedule.py
 ```
 
-This will generate several image files in the current directory, including:
-*   `altitude_vs_time.png`
-*   `rotator_angle_vs_time.png`
-*   `sky_coverage.png`
-*   `sky_coverage_progress.gif`
-
 ### 3. Generate PDF Report
 
-After generating the schedule and plots, you can create a comprehensive PDF report:
+Create a comprehensive PDF report combining all plots and the schedule:
 
 ```bash
 python create_pdf_report.py
 ```
 
-This will generate `schedule_report.pdf`, which includes all generated plots and a detailed tabular schedule for each night, highlighting any observations that violate configured constraints.
-
 ## Scheduling Algorithm
 
-The `plan_observations.py` script employs a hybrid scheduling approach, ensuring high-priority manual targets are fixed while efficiently filling gaps with a greedy optimization strategy.
+The `plan_observations.py` script employs a hybrid scheduling approach:
 
 ### 1. Manual Allocation Phase
-First, the scheduler processes targets defined in `manual_allocation.csv`:
-*   **Prioritization**: Enforces project-specific ordering (e.g., GE targets before GA).
-*   **Smart Grouping**: Spatially adjacent targets (separation < 5°) are grouped into contiguous blocks.
-*   **Slot Optimization**: Finds optimal time slots based on altitude and rotator constraints. It includes logic to "compact" the schedule, shifting blocks to close unusable gaps (< 80 mins) or align with the night's start/end.
+Processes targets defined in the manual allocation CSV:
+*   **Grouping**: Consecutive targets are grouped by program prefix (e.g., `SSP_GA`) or daily (if `--group-all` is used).
+*   **Block Optimization**: `find_optimal_slot` calculates the best time for the *entire block* by maximizing the average altitude while ensuring every target meets its individual constraints (including the `max_altitude` and `relaxed airmass` budget).
+*   **Gap Compaction**: Automatically closes small gaps (< 80 mins) between blocks to maximize night efficiency, respecting the `max_relaxed_count` quota.
 
 ### 2. Auto-Scheduling Phase (Greedy Gap Filling)
-Remaining time slots are filled dynamically:
-*   **Constraint Checking**: Calculates visibility for all candidates using parallel processing, checking airmass, rotator limits, and moon constraints (brightness/distance).
-*   **Scoring & Selection**:
-    1.  **Overlap**: Prioritizes targets overlapping with recent observations to maximize survey continuity.
-    2.  **Efficiency Score**: For non-overlapping targets, selects based on `Altitude - (Slew Penalty * Distance)`, balancing airmass against slew time.
+Fills remaining gaps with unscheduled targets:
+*   **Parallel Processing**: Efficiently checks visibility for hundreds of candidates simultaneously.
+*   **Multi-Priority Greedy**: Iterates through priorities and selects the best candidate based on altitude and slew distance.
+*   **Overlap Logic**: Prioritizes fields spatially close to recently observed targets to maintain survey continuity.
 
 ## File Structure
 
 *   `plan_observations.py`: Main scheduling logic.
-*   `plot_schedule.py`: Visualization tools.
-*   `create_pdf_report.py`: Generates a comprehensive PDF report of the schedule and plots.
-*   `schedule_report.pdf`: The output PDF report.
-*   `obs_utils.py`: Utility functions for observer setup and file I/O.
-*   `Moon.py`: Moon brightness model.
-*   `slew.py`: Slew time calculations.
-*   `obs_config.yaml`: Configuration file.
-*   `requirements.txt`: Python dependencies.
+*   `plot_schedule.py`: Visualization and plotting tools.
+*   `create_pdf_report.py`: PDF report generation.
+*   `obs_utils.py`: Shared utility functions (I/O, observer setup).
+*   `obs_config.yaml`: Central configuration.
+*   `Moon.py` (internal): Moon brightness modeling logic.
 
 ## License
 

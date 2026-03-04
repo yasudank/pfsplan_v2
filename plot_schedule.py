@@ -334,15 +334,7 @@ def plot_rotator_angle_time(schedule, nights, observer, target_colors=None):
 def plot_sky_coverage(schedule, all_targets, target_colors=None):
     """
     Plot Sky Coverage.
-    Two panels:
-    1. RA -30 to 40 (Autumn targets)
-    2. RA 125 to 155 (Spring targets)
-    
-    Plots:
-    - Scheduled targets: Filled circles with specific color
-    - Unobserved targets: Unfilled circles with specific color
-    
-    Colors based on target_colors map.
+    Dynamically sets RA range based on SSP_CO targets and uses a single panel.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
@@ -356,7 +348,27 @@ def plot_sky_coverage(schedule, all_targets, target_colors=None):
     try:
         scheduled_ids = set(s['target'] for s in schedule)
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 16))
+        # 1. Determine RA range for SSP_CO
+        co_ras = [t['target'].coord.ra.deg for t in all_targets if t['id'].startswith('SSP_CO')]
+        if not co_ras:
+            # Fallback if no CO targets
+            ra_min, ra_max = 0, 360
+        else:
+            # Check if targets wrap around 0/360
+            # If the spread is very large (> 180), it's likely a wrap-around
+            if max(co_ras) - min(co_ras) > 180:
+                co_ras_shifted = [ra - 360 if ra > 180 else ra for ra in co_ras]
+                ra_min, ra_max = min(co_ras_shifted), max(co_ras_shifted)
+                use_shifted = True
+            else:
+                ra_min, ra_max = min(co_ras), max(co_ras)
+                use_shifted = False
+        
+        # Add 5 degree margin
+        ra_min -= 5
+        ra_max += 5
+        
+        fig, ax = plt.subplots(figsize=(12, 6))
         
         # Helper for color
         def get_color(tid):
@@ -367,6 +379,10 @@ def plot_sky_coverage(schedule, all_targets, target_colors=None):
             ra = t['target'].coord.ra.deg
             dec = t['target'].coord.dec.deg
             
+            # Apply shift if needed for wrap-around
+            if use_shifted and ra > 180:
+                ra -= 360
+                
             is_scheduled = tid in scheduled_ids
             color = get_color(tid)
             
@@ -383,38 +399,21 @@ def plot_sky_coverage(schedule, all_targets, target_colors=None):
                 fill = False
                 zorder = 1
             
-            # Panel 1: RA -30 to 40
-            # Shift RA: if RA > 180, RA -= 360
-            ra_shifted = ra - 360 if ra > 180 else ra
-            
-            if -35 < ra_shifted < 45: # Loose bounds for inclusion
-                circle = Circle((ra_shifted, dec), 0.7, facecolor=facecolor, edgecolor=edgecolor, alpha=alpha, fill=fill, zorder=zorder)
-                ax1.add_patch(circle)
-            
-            # Panel 2: RA 125 to 155
-            if 120 < ra < 160: # Loose bounds
+            # Only plot if within the detected RA range
+            if ra_min <= ra <= ra_max:
                 circle = Circle((ra, dec), 0.7, facecolor=facecolor, edgecolor=edgecolor, alpha=alpha, fill=fill, zorder=zorder)
-                ax2.add_patch(circle)
+                ax.add_patch(circle)
             
-        ax1.set_xlim(-30, 40)
-        ax1.set_ylim(-6.5, 5) 
-        ax1.set_xlabel("RA (deg)")
-        ax1.set_ylabel("Dec (deg)")
-        ax1.set_title("Sky Coverage (RA -30 to 40)")
-        ax1.grid(True, alpha=0.3)
-        ax1.set_aspect('equal')
-        ax1.invert_xaxis()
+        ax.set_xlim(ra_min, ra_max)
+        ax.set_ylim(-10, 10) # Standard Dec range for these targets
+        ax.set_xlabel("RA (deg)")
+        ax.set_ylabel("Dec (deg)")
+        ax.set_title(f"Sky Coverage (RA {ra_min:.1f} to {ra_max:.1f})")
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+        ax.invert_xaxis()
         
-        ax2.set_xlim(125, 155)
-        ax2.set_ylim(-6.5, 5)
-        ax2.set_xlabel("RA (deg)")
-        ax2.set_ylabel("Dec (deg)")
-        ax2.set_title("Sky Coverage (RA 125 to 155)")
-        ax2.grid(True, alpha=0.3)
-        ax2.set_aspect('equal')
-        ax2.invert_xaxis()
-
-        # Custom Legend
+        # Custom Legend - Placed outside to the right
         legend_elements = [
             Line2D([0], [0], marker='o', color='w', label='SSP_CO', markerfacecolor='blueviolet', markersize=10),
             Line2D([0], [0], marker='o', color='w', label='SSP_GA', markerfacecolor='yellowgreen', markersize=10),
@@ -422,13 +421,20 @@ def plot_sky_coverage(schedule, all_targets, target_colors=None):
             Line2D([0], [0], marker='o', color='w', label='Scheduled (Filled)', markerfacecolor='grey', markersize=10),
             Line2D([0], [0], marker='o', color='w', label='Unobserved (Open)', markerfacecolor='none', markeredgecolor='grey', markersize=10),
         ]
-        ax1.legend(handles=legend_elements, loc='upper right')
-        ax2.legend(handles=legend_elements, loc='upper right')
+        ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1), 
+                  fontsize='small', frameon=True, title="Legend")
 
         plt.tight_layout()
-        plt.savefig("sky_coverage.png")
+        plt.savefig("sky_coverage.png", bbox_inches='tight')
         plt.close(fig)
         print("Saved sky_coverage.png")
+        
+    except Exception as e:
+        print(f"Error generating sky coverage plot: {e}")
+        import traceback
+        traceback.print_exc()
+        if 'fig' in locals():
+            plt.close(fig)
         
     except Exception as e:
         print(f"Error generating sky coverage plot: {e}")
@@ -546,6 +552,7 @@ def plot_sky_coverage_mollweide(schedule, all_targets, target_colors=None):
 def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
     """
     Animate Sky Coverage progress (cumulative) over the nights.
+    Uses dynamic RA range and a single panel.
     Saves as 'sky_coverage_progress.gif'.
     """
     import matplotlib.pyplot as plt
@@ -575,7 +582,23 @@ def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
         if tid not in target_first_night or n < target_first_night[tid]:
             target_first_night[tid] = n
             
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 16))
+    # 1. Determine RA range for SSP_CO
+    co_ras = [t['target'].coord.ra.deg for t in all_targets if t['id'].startswith('SSP_CO')]
+    if not co_ras:
+        ra_min, ra_max = 0, 360
+    else:
+        if max(co_ras) - min(co_ras) > 180:
+            co_ras_shifted = [ra - 360 if ra > 180 else ra for ra in co_ras]
+            ra_min, ra_max = min(co_ras_shifted), max(co_ras_shifted)
+            use_shifted = True
+        else:
+            ra_min, ra_max = min(co_ras), max(co_ras)
+            use_shifted = False
+    
+    ra_min -= 5
+    ra_max += 5
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
     
     # Helper for color
     def get_color(tid):
@@ -590,39 +613,27 @@ def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
         dec = t['target'].coord.dec.deg
         color = get_color(tid)
         
+        if use_shifted and ra > 180:
+            ra -= 360
+            
         patches_map[tid] = []
         
-        # Panel 1: RA -30 to 40
-        ra_shifted = ra - 360 if ra > 180 else ra
-        if -35 < ra_shifted < 45:
-            c = Circle((ra_shifted, dec), 0.7, facecolor='none', edgecolor=color, alpha=0.4, fill=False, zorder=1)
-            ax1.add_patch(c)
-            patches_map[tid].append(c)
-            
-        # Panel 2: RA 125 to 155
-        if 120 < ra < 160:
+        # Only plot if within the detected RA range
+        if ra_min <= ra <= ra_max:
             c = Circle((ra, dec), 0.7, facecolor='none', edgecolor=color, alpha=0.4, fill=False, zorder=1)
-            ax2.add_patch(c)
+            ax.add_patch(c)
             patches_map[tid].append(c)
             
     # Axes setup
-    ax1.set_xlim(-30, 40)
-    ax1.set_ylim(-6.5, 5) 
-    ax1.set_xlabel("RA (deg)")
-    ax1.set_ylabel("Dec (deg)")
-    ax1.grid(True, alpha=0.3)
-    ax1.set_aspect('equal')
-    ax1.invert_xaxis()
+    ax.set_xlim(ra_min, ra_max)
+    ax.set_ylim(-10, 10) 
+    ax.set_xlabel("RA (deg)")
+    ax.set_ylabel("Dec (deg)")
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
+    ax.invert_xaxis()
     
-    ax2.set_xlim(125, 155)
-    ax2.set_ylim(-6.5, 5)
-    ax2.set_xlabel("RA (deg)")
-    ax2.set_ylabel("Dec (deg)")
-    ax2.grid(True, alpha=0.3)
-    ax2.set_aspect('equal')
-    ax2.invert_xaxis()
-    
-    # Legend
+    # Custom Legend - Placed outside to the right
     legend_elements = [
         Line2D([0], [0], marker='o', color='w', label='SSP_CO', markerfacecolor='blueviolet', markersize=10),
         Line2D([0], [0], marker='o', color='w', label='SSP_GA', markerfacecolor='yellowgreen', markersize=10),
@@ -630,19 +641,17 @@ def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
         Line2D([0], [0], marker='o', color='w', label='Scheduled (Filled)', markerfacecolor='grey', markersize=10),
         Line2D([0], [0], marker='o', color='w', label='Unobserved (Open)', markerfacecolor='none', markeredgecolor='grey', markersize=10),
     ]
-    ax1.legend(handles=legend_elements, loc='upper right')
-    ax2.legend(handles=legend_elements, loc='upper right')
+    ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1), 
+              fontsize='small', frameon=True, title="Legend")
     
     def update(frame):
         # Update titles
         title_suffix = "Start" if frame == 0 else f"Night {frame}"
-        ax1.set_title(f"Sky Coverage (RA -30 to 40) - {title_suffix}")
-        ax2.set_title(f"Sky Coverage (RA 125 to 155) - {title_suffix}")
+        ax.set_title(f"Sky Coverage Progress - {title_suffix}")
         
         for tid, patches in patches_map.items():
             color = get_color(tid)
             # Check if observed on or before this frame (night)
-            # frame 0 means no observations shown as filled yet
             is_observed = (tid in target_first_night) and (target_first_night[tid] <= frame) and (frame > 0)
             
             for p in patches:
@@ -675,94 +684,145 @@ def animate_sky_coverage_progress(schedule, all_targets, target_colors=None):
 def plot_observation_counts(schedule, all_targets, target_colors=None):
     """
     Plot histogram of observation counts per target.
-    Inset: Observation counts per working group (CO, GA, GE).
+    Grouped for GA and GE as stacked bars.
     """
     print("Generating Observation Counts plot...")
     import matplotlib.pyplot as plt
     from collections import Counter
+    import re
     
     if target_colors is None:
         target_colors = get_target_colors(all_targets)
 
-    # Count observations per target
+    # Count observations per target (ppc_code)
     counts = Counter(s['target'] for s in schedule)
     if not counts:
         print("No observations to plot.")
         return
 
-    # Sort targets for plotting order: Group (CO, GA, GE) then ID
-    def sort_key(tid):
-        # Category score
-        if tid.startswith('SSP_CO'): cat = 1
-        elif tid.startswith('SSP_GA'): cat = 2
-        elif tid.startswith('SSP_GE'): cat = 3
+    def get_group(tid):
+        if tid.startswith('SSP_GA'):
+            # Group by prefix before V00, V01, etc.
+            match = re.search(r'V\d{2}', tid)
+            if match:
+                return tid[:match.start()]
+        elif tid.startswith('SSP_GE'):
+            # Group by prefix before _obs0000a, etc.
+            match = re.search(r'_obs\d{4}', tid)
+            if match:
+                return tid[:match.start()]
+        return tid
+
+    # Group the counts
+    # group_to_tids[group_id] = { tid1: count1, tid2: count2, ... }
+    group_to_tids = {}
+    for tid, count in counts.items():
+        grp = get_group(tid)
+        if grp not in group_to_tids:
+            group_to_tids[grp] = {}
+        group_to_tids[grp][tid] = count
+
+    # Sorting logic for groups
+    def group_sort_key(grp):
+        if grp.startswith('SSP_CO'): cat = 1
+        elif grp.startswith('SSP_GA'): cat = 2
+        elif grp.startswith('SSP_GE'): cat = 3
         else: cat = 4
         
-        # Sub-sort using logic similar to get_target_colors
-        match = re.search(r'_(\d+)h_', tid)
+        # For CO, use the number before 'h' if possible
+        match = re.search(r'_(\d+)h_', grp)
         num = int(match.group(1)) if match else 999999
         
-        return (cat, num, tid)
+        return (cat, num, grp)
 
-    # Only plot targets that were observed
-    observed_tids = sorted(counts.keys(), key=sort_key)
-    
-    # Prepare data for main plot
-    x_labels = observed_tids
-    y_values = [counts[tid] for tid in observed_tids]
-    bar_colors = [target_colors.get(tid, 'grey') for tid in observed_tids]
-    
-    # Prepare data for inset (Group counts)
-    group_counts = {'CO': 0, 'GA': 0, 'GE': 0}
-    for tid, count in counts.items():
-        if tid.startswith('SSP_CO'): group_counts['CO'] += count
-        elif tid.startswith('SSP_GA'): group_counts['GA'] += count
-        elif tid.startswith('SSP_GE'): group_counts['GE'] += count
-    
+    sorted_groups = sorted(group_to_tids.keys(), key=group_sort_key)
+
+    # Create a list with gaps between categories
+    final_groups = []
+    prev_cat = None
+    for grp in sorted_groups:
+        curr_cat = 1 if grp.startswith('SSP_CO') else 2 if grp.startswith('SSP_GA') else 3 if grp.startswith('SSP_GE') else 4
+        if prev_cat is not None and curr_cat != prev_cat:
+            # Insert a few empty slots for a visible gap
+            for _ in range(2):
+                final_groups.append(None)
+        final_groups.append(grp)
+        prev_cat = curr_cat
+
     # Plotting
     fig, ax = plt.subplots(figsize=(12, 6))
+
+    x = np.arange(len(final_groups))
     
-    # Main Bar Chart
-    bars = ax.bar(x_labels, y_values, color=bar_colors)
-    
+    # Draw stacked bars for each group
+    for i, grp in enumerate(final_groups):
+        if grp is None:
+            continue
+        tids_in_grp = sorted(group_to_tids[grp].keys())
+        current_bottom = 0
+        for tid in tids_in_grp:
+            count = group_to_tids[grp][tid]
+            color = target_colors.get(tid, 'grey')
+            ax.bar(i, count, bottom=current_bottom, color=color, edgecolor='none', width=0.8)
+            current_bottom += count
+
     ax.set_ylabel("Observation Count")
-    ax.set_title("Observation Counts per Target")
+    ax.set_title("Observation Counts per Target (Grouped GA/GE)")
+    
+    # Reduce x-axis margins
+    ax.margins(x=0.02)
     
     # Handle x-axis labels
-    if len(x_labels) > 50:
-        ax.set_xlabel("Targets (Sorted by Group: CO -> GA -> GE)")
-        ax.tick_params(labelbottom=False) # Hide labels if too crowded
-    else:
-        ax.set_xlabel("Target ID")
-        plt.xticks(rotation=90, ha='right', fontsize=8)
+    ax.set_xticks(x)
+    x_labels = []
+    co_counter = 0
+    for grp in final_groups:
+        if grp is None:
+            x_labels.append("")
+        elif grp.startswith('SSP_CO'):
+            if co_counter % 2 == 0:
+                # Show label for every 2nd CO target
+                x_labels.append(grp)
+            else:
+                x_labels.append("") 
+            co_counter += 1
+        else:
+            # Clean up label (remove trailing underscores if any)
+            label = grp.rstrip('_')
+            x_labels.append(label)
+            
+    ax.set_xticklabels(x_labels, rotation=90, ha='center', fontsize=7)
 
-    # Inset: Group Counts
-    # Position: Top right [left, bottom, width, height]
-    ax_ins = fig.add_axes([0.75, 0.65, 0.15, 0.2]) 
+    # Inset: Group Counts (Summary)
+    group_summary = {'CO': 0, 'GA': 0, 'GE': 0}
+    for tid, count in counts.items():
+        if tid.startswith('SSP_CO'): group_summary['CO'] += count
+        elif tid.startswith('SSP_GA'): group_summary['GA'] += count
+        elif tid.startswith('SSP_GE'): group_summary['GE'] += count
+    
+    # Position: Top left [left, bottom, width, height]
+    ax_ins = fig.add_axes([0.15, 0.65, 0.15, 0.2]) 
     
     groups = ['CO', 'GA', 'GE']
-    g_vals = [group_counts[g] for g in groups]
-    # Colors representative of the groups (Blue-ish, Green-ish, Red-ish)
+    g_vals = [group_summary[g] for g in groups]
     g_colors = ['blueviolet', 'yellowgreen', 'orangered']
     
     ax_ins.bar(groups, g_vals, color=g_colors)
     ax_ins.set_title("Counts by Group", fontsize=9)
     ax_ins.tick_params(axis='both', which='major', labelsize=8)
     
-    # Adjust ylim to fit labels
     if g_vals:
         ax_ins.set_ylim(0, max(g_vals) * 1.3)
     
-    # Annotate inset bars with count and percentage
     total_obs = sum(g_vals)
     for i, v in enumerate(g_vals):
         pct = (v / total_obs * 100) if total_obs > 0 else 0
         ax_ins.text(i, v, f"{v}\n({pct:.1f}%)", ha='center', va='bottom', fontsize=7)
     
-    # Add grid for y-axis on main plot
     ax.grid(axis='y', linestyle='--', alpha=0.5)
 
-    plt.tight_layout() # Note: tight_layout might warn with add_axes, but usually works ok-ish or ignored
+    # Use tight_layout but exclude the inset to prevent layout shifts
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig("observation_counts.png")
     plt.close(fig)
     print("Saved observation_counts.png")
@@ -806,7 +866,7 @@ def main():
     num_nights = max(s['night'] for s in schedule)
         
     try:
-        nights = read_obsdates('obsdates_2026Jan.txt', observer)
+        nights = read_obsdates('obsdates_2026Mar.txt', observer)
         print(f"Loaded {len(nights)} observation windows.")
     except FileNotFoundError:
         print("Error: Observation dates file 'obsdates_2025Nov.txt' not found.")

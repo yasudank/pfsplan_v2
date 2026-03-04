@@ -82,10 +82,12 @@ def main():
 
     # 4. Generate Output Rows
     output_rows = {cat: [] for cat in categories}
+    processed_targets = set()
 
     for blk in all_blocks:
         tgt = blk['target']
         if tgt in metadata:
+            processed_targets.add(tgt)
             meta = metadata[tgt]
             cat = meta['cat']
             row = meta['data'].copy()
@@ -120,6 +122,45 @@ def main():
             output_rows[cat].append(row)
         else:
             print(f"Warning: Scheduled target {tgt} not found in pfs_designs summary files.")
+
+    # 4.5 Add backup targets (unscheduled)
+    # Date logic: 1 day after the last allocated observation
+    if not schedule_df.empty:
+        last_obs_time = schedule_df['start_time'].max()
+        # UTC date + 1 day
+        backup_date_utc = last_obs_time.date() + datetime.timedelta(days=1)
+    else:
+        backup_date_utc = datetime.date.today() + datetime.timedelta(days=1)
+
+    backup_counts = {cat: 0 for cat in categories}
+
+    for ppc_code, meta in metadata.items():
+        if ppc_code not in processed_targets:
+            cat = meta['cat']
+            row = meta['data'].copy()
+            
+            # Update time: Keep time, change date to backup_date_utc
+            if 'ppc_obstime_utc' in row and pd.notna(row['ppc_obstime_utc']):
+                try:
+                    # Parse original
+                    orig_dt = pd.to_datetime(row['ppc_obstime_utc'])
+                    # Construct new dt with backup date and original time
+                    new_dt = orig_dt.replace(year=backup_date_utc.year, month=backup_date_utc.month, day=backup_date_utc.day)
+                    row['ppc_obstime_utc'] = new_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    
+                    # Update HST if present (based on new UTC)
+                    if 'ppc_obstime' in row:
+                        hst_dt = new_dt - pd.Timedelta(hours=10)
+                        row['ppc_obstime'] = hst_dt.strftime('%Y-%m-%dT%H:%M:%S')
+                except Exception as e:
+                    print(f"Warning: Failed to update time for backup target {ppc_code}: {e}")
+            
+            output_rows[cat].append(row)
+            backup_counts[cat] += 1
+
+    for cat, count in backup_counts.items():
+        if count > 0:
+            print(f"Added {count} backup targets for {cat} (date set to {backup_date_utc}).")
 
     # 5. Write Files
     for cat in categories:

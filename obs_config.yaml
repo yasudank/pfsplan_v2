@@ -7,7 +7,10 @@ slew:
 
 constraints:
   max_airmass: 1.6
+  max_airmass_relaxed: 2.2
+  max_relaxed_count: 4
   min_altitude: 0.0   # degrees
+  max_altitude: 75.0  # degrees
   min_teff: 0.6
   rotator_min: -174.0 # degrees
   rotator_max: 174.0  # degrees
@@ -18,6 +21,8 @@ constraints:
 scheduling:
   min_overhead_min: 5        # minutes
   manual_readout_min: 15     # minutes
+  group_all_manual_daily: false # if true, treat all manual targets in a day as one block
+  group_all_exclude_dates: []   # e.g., ['2026-03-16']
   overlap_separation_deg: 1.4 # degrees
   adjacency_bonus_window_sec: 5.0
   adjacency_bonus_score: 1000.0

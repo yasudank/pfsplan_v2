@@ -147,32 +147,24 @@ def create_pdf_report(csv_file, output_pdf=None):
     
     # --- Page 2: Additional Visuals ---
     elements.append(Paragraph("Sky Coverage & Statistics", title_style))
-    elements.append(Spacer(1, 0.5*cm))
+    elements.append(Spacer(1, 0.1*cm))
     
     try:
-        images_row_2 = []
         if os.path.exists('sky_coverage.png'):
-            # sky_coverage is tall
-            img_sky = Image('sky_coverage.png', width=13.5*cm, height=16*cm, kind='proportional')
-            images_row_2.append(img_sky)
+            # sky_coverage height kept at 8.5cm as requested
+            img_sky = Image('sky_coverage.png', width=25*cm, height=8.5*cm, kind='proportional')
+            elements.append(img_sky)
+            elements.append(Spacer(1, 0.2*cm))
         else:
-            images_row_2.append(Paragraph("Sky Coverage Plot Missing", styles['Normal']))
+            elements.append(Paragraph("Sky Coverage Plot Missing", styles['Normal']))
 
         if os.path.exists('observation_counts.png'):
-            img_counts = Image('observation_counts.png', width=13.5*cm, height=16*cm, kind='proportional')
-            images_row_2.append(img_counts)
+            # observation_counts made as large as possible to fit on the same page
+            #img_counts = Image('observation_counts.png', width=27*cm, height=9.2*cm, kind='proportional')
+            img_counts = Image('observation_counts.png', width=27*cm, height=11.0*cm, kind='proportional')
+            elements.append(img_counts)
         else:
-            images_row_2.append(Paragraph("Counts Plot Missing", styles['Normal']))
-            
-        if images_row_2:
-            t_images_2 = Table([images_row_2], colWidths=[13.8*cm, 13.8*cm])
-            t_images_2.setStyle(TableStyle([
-                ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-                ('LEFTPADDING', (0,0), (-1,-1), 0),
-                ('RIGHTPADDING', (0,0), (-1,-1), 0),
-            ]))
-            elements.append(t_images_2)
+            elements.append(Paragraph("Counts Plot Missing", styles['Normal']))
             
     except Exception as e:
         print(f"Warning: Could not add page 2 images to report: {e}")

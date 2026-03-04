@@ -35,6 +35,7 @@ def load_config(filename='obs_config.yaml'):
             'constraints': {
                 'max_airmass': 1.6,
                 'min_altitude': 0.0,
+                'max_altitude': 75.0,
                 'min_teff': 0.6,
                 'rotator_min': -174.0,
                 'rotator_max': 174.0
@@ -42,6 +43,8 @@ def load_config(filename='obs_config.yaml'):
             'scheduling': {
                 'min_overhead_min': 5,
                 'manual_readout_min': 15,
+                'group_all_manual_daily': False,
+                'group_all_exclude_dates': [],
                 'overlap_separation_deg': 1.4,
                 'adjacency_bonus_window_sec': 5.0,
                 'adjacency_bonus_score': 1000.0,
@@ -206,7 +209,7 @@ def check_visibility_worker(args):
     (t, current_time, current_pointing, cur_altaz, current_rotator_angle, 
      next_reservation_start, observer, slew_params, min_overhead, 
      max_airmass, rot_min, rot_max, min_teff, 
-     moon_coord, moon_altaz, moon_phase, mbm, verbose) = args
+     moon_coord, moon_altaz, moon_phase, mbm, verbose, max_altitude) = args
 
     try:
         # Calculate potential overhead including slew
@@ -239,7 +242,7 @@ def check_visibility_worker(args):
         pa_angle_obs_mid = observer.parallactic_angle(obs_mid_time_for_eval, t['target']).to(u.deg).value
         rotator_angle_obs_mid = Angle((pa_angle_obs_mid + t['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
 
-        if airmass <= max_airmass and alt > 0:
+        if airmass <= max_airmass and alt > 0 and alt <= max_altitude:
             # Check instrument rotator angle constraint at observation mid-point
             if rotator_angle_obs_mid < rot_min or rotator_angle_obs_mid > rot_max:
                 return None
@@ -349,21 +352,22 @@ def load_manual_schedule(filename):
         print(f"Error reading manual allocation: {e}")
     return manual_schedule
 
-def find_optimal_slot(observer, target_info, duration, night_start, night_end, busy_slots, time_step, target_ppc_pa, config):
+def find_optimal_slot(observer, group_targets, total_duration, night_start, night_end, busy_slots, time_step, config, remaining_relaxed_budget):
     """
-    Find the best time slot for a target within the night to maximize altitude.
+    Find the best time slot for a group of targets to maximize their average altitude.
     Must not overlap with busy_slots.
-    Prioritizes slots adjacent to existing busy_slots to minimize gaps by adding specific candidates
-    and applying a large score bonus.
-    Also, filters out slots where the instrument rotator angle is out of bounds.
+    Allows up to remaining_relaxed_budget frames to use max_airmass_relaxed.
     """
     best_time = None
     best_score = -np.inf
+    best_relaxed_count = 0
     
     # Config parameters
     rot_min = config['constraints']['rotator_min']
     rot_max = config['constraints']['rotator_max']
     max_airmass = config['constraints']['max_airmass']
+    max_airmass_relaxed = config['constraints']['max_airmass_relaxed']
+    max_altitude = config['constraints']['max_altitude']
     adj_window = config['scheduling']['adjacency_bonus_window_sec']
     adj_bonus = config['scheduling']['adjacency_bonus_score']
     
@@ -373,106 +377,122 @@ def find_optimal_slot(observer, target_info, duration, night_start, night_end, b
         'rotator': 0,
         'airmass': 0,
         'altitude': 0,
+        'max_altitude': 0,
         'total_checked': 0
     }
+
+    # Overhead/Block length for relative timing
+    min_overhead = config['scheduling']['min_overhead_min'] * u.min
+    manual_readout_exptime = config['scheduling']['manual_readout_min'] * u.min
+    manual_block_len = min_overhead + manual_readout_exptime
 
     # 1. Generate candidate times (base grid)
     candidates = []
     curr = night_start
-    while curr + duration <= night_end:
+    while curr + total_duration <= night_end:
         candidates.append(curr)
         curr += time_step
         
     # 2. Add adjacent candidates
     for b_start, b_end in busy_slots:
-        # Immediately after an existing slot
-        if b_end + duration <= night_end:
+        if b_end + total_duration <= night_end:
             candidates.append(b_end)
-        # Immediately before an existing slot
-        if b_start - duration >= night_start:
-            candidates.append(b_start - duration)
+        if b_start - total_duration >= night_start:
+            candidates.append(b_start - total_duration)
             
-    # Filter valid times
+    # Filter valid times (Overlap check)
     valid_times = []
     for t_start in candidates:
-        t_end = t_start + duration
-        
-        # Bounds check
+        fail_stats['total_checked'] += 1
+        t_end = t_start + total_duration
         if t_start < night_start or t_end > night_end:
             continue
-            
-        # Overlap check
         is_valid = True
         for b_start, b_end in busy_slots:
-            # Intersection: not (End <= Start OR Start >= End)
-            # Use a small tolerance (e.g. 1 sec) to allow touching
-            # Intersection occurs if (my_start < b_end - tol) and (my_end > b_start + tol)
             if (t_start < b_end - 1*u.s) and (t_end > b_start + 1*u.s):
                 is_valid = False
                 break
-        
-        fail_stats['total_checked'] += 1
         if is_valid:
             valid_times.append(t_start)
         else:
             fail_stats['overlap'] += 1
 
-    if not valid_times:
-        if fail_stats['total_checked'] > 0:
-            print(f"    - [Debug] {target_info['id']}: No valid slots found (checked {fail_stats['total_checked']}). All overlapped or out of bounds.")
-        return None
-
-    # Evaluate altitudes for valid slots
+    # Evaluate group for valid slots
     for t_start in valid_times:
-        t_end = t_start + duration
-        t_mid = t_start + duration / 2
+        current_offset = 0 * u.s
+        group_alt_sum = 0
+        group_valid = True
+        current_group_relaxed_count = 0
         
-        # Calculate parallactic angle for current time
-        # Note: parallactic_angle returns a Quantity, convert to value for comparison
-        pa_angle = observer.parallactic_angle(t_mid, target_info['target']).to(u.deg).value
-        
-        # Calculate rotator angle and wrap at 180 degrees
-        raw_rotator_angle = pa_angle + target_ppc_pa
-        rotator_angle = Angle(raw_rotator_angle * u.deg).wrap_at(180 * u.deg).value
-
-        # Check instrument rotator angle constraint
-        if rotator_angle < rot_min or rotator_angle > rot_max:
-            fail_stats['rotator'] += 1
-            continue # Skip this slot as it's outside the allowed rotator angle range
+        for target_info in group_targets:
+            nframes = target_info.get('nframes', 1)
+            target_duration = nframes * manual_block_len
             
-        # Calculate altitude/airmass at mid-point
-        altaz = observer.altaz(t_mid, target_info['target'])
-        alt = altaz.alt.deg
-        airmass = altaz.secz
-        
-        if airmass > max_airmass:
-            fail_stats['airmass'] += 1
-            continue
-        
-        if alt <= 0: # Check altitude > 0
-            fail_stats['altitude'] += 1
+            # Mid-point of this target's sub-block
+            t_mid = t_start + current_offset + target_duration / 2
+            
+            # Constraints check for this target
+            pa_angle = observer.parallactic_angle(t_mid, target_info['target']).to(u.deg).value
+            rotator_angle = Angle((pa_angle + target_info['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
+
+            if rotator_angle < rot_min or rotator_angle > rot_max:
+                group_valid = False
+                fail_stats['rotator'] += 1
+                break
+                
+            altaz = observer.altaz(t_mid, target_info['target'])
+            alt = altaz.alt.deg
+            airmass = altaz.secz
+            
+            # Check Airmass with Relaxed logic
+            if airmass > max_airmass:
+                if airmass <= max_airmass_relaxed and (current_group_relaxed_count + nframes) <= remaining_relaxed_budget:
+                    # Within budget, mark as relaxed
+                    current_group_relaxed_count += nframes
+                else:
+                    group_valid = False
+                    fail_stats['airmass'] += 1
+                    break
+            
+            if alt <= 0:
+                group_valid = False
+                fail_stats['altitude'] += 1
+                break
+            
+            if alt > max_altitude:
+                group_valid = False
+                fail_stats['max_altitude'] += 1
+                break
+            
+            group_alt_sum += alt
+            current_offset += target_duration
+            
+        if not group_valid:
             continue
             
         # Adjacency Bonus
         bonus = 0
+        t_end = t_start + total_duration
         for b_start, b_end in busy_slots:
             if abs((t_start - b_end).sec) < adj_window or abs((t_end - b_start).sec) < adj_window:
-                bonus = adj_bonus # Massive bonus to force adjacency
+                bonus = adj_bonus
                 break
         
-        score = alt + bonus
+        avg_alt = group_alt_sum / len(group_targets)
+        score = avg_alt + bonus
         
-        # Only consider valid altitudes (and prefer higher score)
         if score > best_score:
             best_score = score
             best_time = t_start
+            best_relaxed_count = current_group_relaxed_count
             
     if best_time is None:
-        print(f"    - [Debug] {target_info['id']}: Failed to find slot. Reasons: Overlap={fail_stats['overlap']}, Rotator={fail_stats['rotator']}, Airmass={fail_stats['airmass']}, Altitude={fail_stats['altitude']} (from {fail_stats['total_checked']} candidates).")
+        group_id = group_targets[0]['id'] if group_targets else "Unknown"
+        print(f"    - [Debug] Group starting with {group_id}: Failed to find slot. Reasons: Overlap={fail_stats['overlap']}, Rotator={fail_stats['rotator']}, Airmass={fail_stats['airmass']}, Altitude={fail_stats['altitude']}, MaxAlt={fail_stats['max_altitude']} (from {fail_stats['total_checked']} candidates).")
 
-    return best_time
+    return best_time, best_relaxed_count
 
-def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbose=False):
+def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbose=False, verbose_slew=False):
     """
     Run the scheduler with manual allocation and greedy auto-scheduling.
     """
@@ -487,6 +507,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
     
     # Constraints
     max_airmass = config['constraints']['max_airmass']
+    max_altitude = config['constraints']['max_altitude']
     min_teff = config['constraints']['min_teff']
     rot_min = config['constraints']['rotator_min']
     rot_max = config['constraints']['rotator_max']
@@ -520,47 +541,85 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                 # Use requests in the order they appear in the CSV to preserve user intent
                 sorted_requests = manual_requests
                 
+                # Helper to count frames currently violating standard airmass
+                def count_relaxed_frames(current_reservations):
+                    count = 0
+                    for r_start, r_end, r_target, r_nframes in current_reservations:
+                        r_mid = r_start + (r_end - r_start)/2
+                        altaz = observer.altaz(r_mid, r_target['target'])
+                        if altaz.secz > config['constraints']['max_airmass']:
+                            count += r_nframes
+                    return count
+
                 # Helper to check constraints for a specific time slot
-                def check_slot_constraints(t_start, t_end, t_info):
+                def check_slot_constraints(t_start, t_end, t_info, allow_relaxed=False):
                     t_mid = t_start + (t_end - t_start)/2
                     # Rotator
                     pa = observer.parallactic_angle(t_mid, t_info['target']).to(u.deg).value
                     rot = Angle((pa + t_info['ppc_pa']) * u.deg).wrap_at(180 * u.deg).value
                     if not (config['constraints']['rotator_min'] <= rot <= config['constraints']['rotator_max']):
-                        return False
+                        return False, f"Rotator ({rot:.1f} deg)"
                     # Airmass
                     altaz = observer.altaz(t_mid, t_info['target'])
-                    if altaz.alt.deg <= 0: return False
-                    if altaz.secz > config['constraints']['max_airmass']:
-                         return False
-                    return True
+                    if altaz.alt.deg <= 0: 
+                        return False, f"Altitude ({altaz.alt.deg:.1f} deg)"
+                    
+                    if altaz.alt.deg > config['constraints']['max_altitude']:
+                        return False, f"Altitude ({altaz.alt.deg:.1f} deg > {config['constraints']['max_altitude']})"
+                    
+                    # Choose limit
+                    current_max_airmass = config['constraints']['max_airmass_relaxed'] if allow_relaxed else config['constraints']['max_airmass']
+                    
+                    if altaz.secz > current_max_airmass:
+                         return False, f"Airmass ({altaz.secz:.2f} > {current_max_airmass})"
+                    return True, None
                 
-                # Group requests by target proximity to optimize contiguous blocks
+                # Group requests by program prefix (e.g., SSP_GA) to optimize contiguous blocks
+                def get_prefix(ppc_code):
+                    # For SSP_GA_..., extract SSP_GA
+                    parts = ppc_code.split('_')
+                    if len(parts) >= 2:
+                        return "_".join(parts[:2])
+                    return ppc_code
+
                 grouped_requests = []
                 if sorted_requests:
-                    current_group = [sorted_requests[0]]
-                    first_info = all_targets[sorted_requests[0]['ppc_code']]
-                    current_coord = first_info['target'].coord
+                    # Check if this date should be grouped as a single block
+                    should_group_all = config['scheduling'].get('group_all_manual_daily', False)
+                    exclude_dates = config['scheduling'].get('group_all_exclude_dates', [])
                     
-                    for i in range(1, len(sorted_requests)):
-                        req = sorted_requests[i]
-                        info = all_targets[req['ppc_code']]
-                        coord = info['target'].coord
+                    if hst_date_str in exclude_dates:
+                        should_group_all = False
+                        print(f"    - [Note] {hst_date_str} is in exclude_dates. Skipping group-all.")
+
+                    if should_group_all:
+                        # Treat all requests for the day as one single block
+                        grouped_requests = [sorted_requests]
+                    else:
+                        # Standard grouping by prefix
+                        current_group = [sorted_requests[0]]
+                        current_prefix = get_prefix(sorted_requests[0]['ppc_code'])
                         
-                        if current_coord.separation(coord) < 5.0 * u.deg:
-                            current_group.append(req)
-                        else:
-                            grouped_requests.append(current_group)
-                            current_group = [req]
-                            current_coord = coord
-                    grouped_requests.append(current_group)
+                        for i in range(1, len(sorted_requests)):
+                            req = sorted_requests[i]
+                            prefix = get_prefix(req['ppc_code'])
+                            
+                            if prefix == current_prefix:
+                                current_group.append(req)
+                            else:
+                                grouped_requests.append(current_group)
+                                current_group = [req]
+                                current_prefix = prefix
+                        grouped_requests.append(current_group)
                 
                 # Loop over groups
                 for group_idx, group in enumerate(grouped_requests):
-                    # Representative info (first in group)
-                    rep_req = group[0]
-                    rep_ppc_code = rep_req['ppc_code']
-                    rep_info = all_targets[rep_ppc_code]
+                    # Prepare full info for all targets in the group
+                    group_full_info = []
+                    for req in group:
+                        info = all_targets[req['ppc_code']].copy()
+                        info['nframes'] = req['nframes']
+                        group_full_info.append(info)
                     
                     # Calculate total duration
                     group_nframes = sum(r['nframes'] for r in group)
@@ -572,13 +631,18 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     # Find slot for combined block
                     busy = [(r[0], r[1]) for r in reservations]
                     
-                    # Using representative target for optimization
-                    start_slot = find_optimal_slot(observer, rep_info, total_duration, search_start, end_time, busy, 1*u.min, rep_info['ppc_pa'], config)
+                    # Calculate currently used relaxed budget
+                    night_relaxed_used = count_relaxed_frames(reservations)
+                    remaining_budget = config['constraints']['max_relaxed_count'] - night_relaxed_used
+                    
+                    # Find optimal slot for the entire group (optimizing average altitude)
+                    start_slot, used_relaxed = find_optimal_slot(observer, group_full_info, total_duration, search_start, end_time, busy, 1*u.min, config, remaining_budget)
                     
                     if start_slot:
                         # --- Gap Check Logic ---
-                        # Use variable names consistent with logic below
-                        ppc_code = rep_ppc_code + " (Group)"
+                        # Use first target for representative constraint check in adjustment
+                        rep_info = group_full_info[0]
+                        ppc_code = get_prefix(rep_info['id']) + f" (Group of {len(group)})"
                         target_info = rep_info # For constraints check
                         
                         # Define minimum gap for Auto observations (4 frames)
@@ -654,22 +718,21 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
 
                         # Decompose group and schedule individual targets
                         curr_slot_start = start_slot
-                        for req in group:
-                            req_code = req['ppc_code']
-                            req_info = all_targets[req_code]
+                        for req in group_full_info:
+                            req_code = req['id']
                             req_frames = req['nframes']
                             req_dur = req_frames * manual_block_len
                             
                             req_end = curr_slot_start + req_dur
-                            reservations.append((curr_slot_start, req_end, req_info, req_frames))
+                            reservations.append((curr_slot_start, req_end, req, req_frames))
                             
-                            mid_alt = observer.altaz(curr_slot_start + req_dur/2, req_info['target']).alt.deg
+                            mid_alt = observer.altaz(curr_slot_start + req_dur/2, req['target']).alt.deg
                             print(f"    - Scheduled {req_code} ({req_frames} frames) at {curr_slot_start.iso} (Avg Alt: {mid_alt:.1f})")
-                            req_info['observed'] = True 
+                            req['observed'] = True 
                             
                             curr_slot_start = req_end
                     else:
-                        print(f"    - [Warning] Could not find slot for group starting with {rep_ppc_code}!")
+                        print(f"    - [Warning] Could not find slot for group {get_prefix(group[0]['ppc_code'])}!")
 
             # Sort reservations by start time
             reservations.sort(key=lambda x: x[0])
@@ -688,9 +751,19 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     new_start = start_time
                     new_end = new_start + (r_end - r_start)
                     
-                    if check_slot_constraints(new_start, new_end, r_target):
-                        print(f"    - [Compact] Closing start gap ({gap.to(u.min):.1f}). Shifting {r_target['id']} to {new_start.iso}")
-                        reservations[0] = (new_start, new_end, r_target, r_nframes)
+                    is_valid, reason = check_slot_constraints(new_start, new_end, r_target, allow_relaxed=True)
+                    if is_valid:
+                        temp_reservations = list(reservations)
+                        temp_reservations[0] = (new_start, new_end, r_target, r_nframes)
+                        relaxed_count = count_relaxed_frames(temp_reservations)
+                        
+                        if relaxed_count <= config['constraints']['max_relaxed_count']:
+                            print(f"    - [Compact] Closing start gap ({gap.to(u.min):.1f}). Shifting {r_target['id']} to {new_start.iso} (Relaxed Count: {relaxed_count}/{config['constraints']['max_relaxed_count']})")
+                            reservations[0] = (new_start, new_end, r_target, r_nframes)
+                        else:
+                            print(f"    - [Compact] Cannot shift {r_target['id']} (Relaxed quota {relaxed_count} > {config['constraints']['max_relaxed_count']}).")
+                    else:
+                        print(f"    - [Compact] Cannot shift {r_target['id']} to start: {reason} violated.")
 
             # 2. Check Gaps between Blocks
             for i in range(len(reservations) - 1):
@@ -705,11 +778,19 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     new_start = curr_end
                     new_end = new_start + duration
                     
-                    if check_slot_constraints(new_start, new_end, next_target):
-                        print(f"    - [Compact] Closing inter-block gap ({gap.to(u.min):.1f}). Shifting {next_target['id']} to {new_start.iso}")
-                        reservations[i+1] = (new_start, new_end, next_target, next_nframes)
-                        # Update local variable for next iteration? No, next iteration uses i+1 as curr.
-                        # But we updated reservations list, so next iter will see new values. Correct.
+                    is_valid, reason = check_slot_constraints(new_start, new_end, next_target, allow_relaxed=True)
+                    if is_valid:
+                        temp_reservations = list(reservations)
+                        temp_reservations[i+1] = (new_start, new_end, next_target, next_nframes)
+                        relaxed_count = count_relaxed_frames(temp_reservations)
+                        
+                        if relaxed_count <= config['constraints']['max_relaxed_count']:
+                            print(f"    - [Compact] Closing inter-block gap ({gap.to(u.min):.1f}). Shifting {next_target['id']} to {new_start.iso} (Relaxed Count: {relaxed_count}/{config['constraints']['max_relaxed_count']})")
+                            reservations[i+1] = (new_start, new_end, next_target, next_nframes)
+                        else:
+                            print(f"    - [Compact] Cannot close gap before {next_target['id']} (Relaxed quota {relaxed_count} > {config['constraints']['max_relaxed_count']}).")
+                    else:
+                        print(f"    - [Compact] Cannot close gap before {next_target['id']}: {reason} violated.")
 
             # 3. Check Gap from Last Block to Night End
             if reservations:
@@ -732,24 +813,32 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                     # Check constraints for all blocks in cluster
                     valid_shift = True
                     shift_amount = gap # Shift exactly to end
+                    fail_reason = ""
                     
-                    # Check if shifting all these targets is valid
+                    # Prepare proposed state
+                    proposed_reservations = list(reservations)
                     for idx in indices_to_shift:
                         r_start, r_end, r_target, r_nframes = reservations[idx]
                         new_start = r_start + shift_amount
                         new_end = r_end + shift_amount
-                        if not check_slot_constraints(new_start, new_end, r_target):
+                        proposed_reservations[idx] = (new_start, new_end, r_target, r_nframes)
+                        
+                        is_valid, reason = check_slot_constraints(new_start, new_end, r_target, allow_relaxed=True)
+                        if not is_valid:
                             valid_shift = False
-                            print(f"    - [Compact] Cannot shift block ending with {reservations[-1][2]['id']} because {r_target['id']} would violate constraints.")
+                            fail_reason = f"{r_target['id']} would violate {reason}"
                             break
                     
                     if valid_shift:
-                         print(f"    - [Compact] Closing end gap ({gap.to(u.min):.1f}). Shifting {len(indices_to_shift)} blocks to end of night.")
-                         for idx in indices_to_shift:
-                             r_start, r_end, r_target, r_nframes = reservations[idx]
-                             new_start = r_start + shift_amount
-                             new_end = r_end + shift_amount
-                             reservations[idx] = (new_start, new_end, r_target, r_nframes)
+                        # Check global relaxed quota for the night
+                        relaxed_count = count_relaxed_frames(proposed_reservations)
+                        if relaxed_count <= config['constraints']['max_relaxed_count']:
+                             print(f"    - [Compact] Closing end gap ({gap.to(u.min):.1f}). Shifting {len(indices_to_shift)} blocks to end of night. (Relaxed Count: {relaxed_count}/{config['constraints']['max_relaxed_count']})")
+                             reservations[:] = proposed_reservations
+                        else:
+                             print(f"    - [Compact] Cannot shift end block: Relaxed quota {relaxed_count} would exceed {config['constraints']['max_relaxed_count']}.")
+                    else:
+                         print(f"    - [Compact] Cannot shift end block: {fail_reason}")
 
             # Mark reserved manual targets as observed
             for r_start, r_end, r_target, r_nframes in reservations:
@@ -830,6 +919,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                             'exptime': 900, # 15 min assumption
                             'ra': r_target['target'].coord.ra.deg,
                             'dec': r_target['target'].coord.dec.deg,
+                            'slew_time': 0.0,
                             'note': 'Manual'
                         })
                         if r_target['target'].coord not in observed_history:
@@ -878,7 +968,7 @@ def run_scheduler(observer, all_targets, manual_schedule, nights, config, verbos
                                 t, current_time, current_pointing, cur_altaz, current_rotator_angle, 
                                 next_reservation_start, observer, slew_params, min_overhead, 
                                 max_airmass, rot_min, rot_max, min_teff, 
-                                moon_coord, moon_altaz, moon_phase, mbm, verbose
+                                moon_coord, moon_altaz, moon_phase, mbm, verbose_slew, max_altitude
                             ))
                         
                         # Run parallel check
@@ -999,13 +1089,26 @@ def main():
 
     parser = argparse.ArgumentParser(description="Plan PFS observations.")
     parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbose output for debugging.")
+    parser.add_argument('--verbose-slew', action='store_true', help="Enable verbose output for slew time calculation details.")
     parser.add_argument('--config', type=str, default='obs_config.yaml', help="Path to configuration file.")
+    parser.add_argument('--manual', type=str, default='manual_allocation_2026Mar.csv', help="Path to manual allocation CSV.")
+    parser.add_argument('--obsdates', type=str, default='obsdates_2026Mar.txt', help="Path to observation dates text file.")
+    parser.add_argument('--group-all', action='store_true', help="Treat all manual targets for a day as one block, regardless of prefix.")
+    parser.add_argument('--exclude-dates', type=str, default=None, help="Comma-separated list of dates (YYYY-MM-DD) to exclude from group-all processing.")
     args = parser.parse_args()
 
     observer = setup_observer()
     
     # Load config
     config = load_config(args.config)
+    
+    # Override group_all if flag is set
+    if args.group_all:
+        config['scheduling']['group_all_manual_daily'] = True
+    
+    # Override exclude-dates if provided
+    if args.exclude_dates:
+        config['scheduling']['group_all_exclude_dates'] = [d.strip() for d in args.exclude_dates.split(',')]
     
     # Read priorities
     priorities = read_priorities('targets/CO/ppcList.ecsv')
@@ -1018,20 +1121,26 @@ def main():
     
     # Load manual schedule
     print("Loading manual schedule...")
-    manual_schedule = load_manual_schedule('manual_allocation.csv')
+    manual_schedule = load_manual_schedule(args.manual)
     
     # Load dates
-    nights = read_obsdates('obsdates_2026Jan.txt', observer)
+    nights = read_obsdates(args.obsdates, observer)
     print(f"Loaded {len(nights)} nights.")
     
     # Run scheduler
-    schedule = run_scheduler(observer, all_targets, manual_schedule, nights, config, verbose=args.verbose)
+    schedule = run_scheduler(observer, all_targets, manual_schedule, nights, config, verbose=args.verbose, verbose_slew=args.verbose_slew)
     
     # Save to CSV
     if schedule:
-        keys = schedule[0].keys()
+        # Collect all unique keys from all entries in the schedule
+        all_keys = []
+        for entry in schedule:
+            for k in entry.keys():
+                if k not in all_keys:
+                    all_keys.append(k)
+                    
         with open('observation_schedule.csv', 'w', newline='') as f:
-            dict_writer = csv.DictWriter(f, keys)
+            dict_writer = csv.DictWriter(f, all_keys)
             dict_writer.writeheader()
             dict_writer.writerows(schedule)
         print(f"\nSchedule saved to observation_schedule.csv with {len(schedule)} observations.")

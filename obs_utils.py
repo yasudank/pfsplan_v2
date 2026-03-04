@@ -58,7 +58,8 @@ def read_targets(filename, priorities):
                 'target': target,
                 'exptime': float(row['ppc_exptime']),
                 'observed': False,
-                'priority': priority
+                'priority': priority,
+                'ppc_pa': float(row['ppc_pa']) if 'ppc_pa' in row else 0.0
             })
     return targets
 
@@ -79,7 +80,8 @@ def read_targets_from_ppcList(filename, priorities):
             'target': target,
             'exptime': float(row['ppc_exptime']),
             'observed': False,
-            'priority': priority
+            'priority': priority,
+            'ppc_pa': float(row['ppc_pa']) if 'ppc_pa' in row else 0.0
         })
     return targets
 
